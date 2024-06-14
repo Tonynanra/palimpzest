@@ -1,6 +1,7 @@
 import time
 from palimpzest.dataclasses import OperatorStats, PlanStats
 from palimpzest.datamanager import DataDirectory
+from palimpzest.operators.convert import ConvertOp, LLMConvert
 from palimpzest.operators.physical import DataSourcePhysicalOperator, LimitScanOp
 from palimpzest.operators.filter import FilterOp
 from palimpzest.planner import LogicalPlanner, PhysicalPlanner, PhysicalPlan
@@ -18,19 +19,39 @@ import os
 import shutil
 
 
-class Execute:
-    def __new__(
-        cls,
+class ExecutionEngine:
+    def __init__(self) -> None:
+        raise NotImplementedError
+
+class SimpleExecution(ExecutionEngine):
+
+    def __init__(self,
+            num_samples: int=20,
+            nocache: bool=False,
+            include_baselines: bool=False,
+            min_plans: Optional[int] = None,
+            verbose: bool = False,
+            allow_model_selection: Optional[bool]=True,
+            allow_code_synth: Optional[bool]=True,
+            allow_token_reduction: Optional[bool]=True,
+            useParallelOps: Optional[bool]=False,
+        ) -> None:
+        self.num_samples = num_samples
+        self.nocache = nocache
+        self.include_baselines = include_baselines
+        self.min_plans = min_plans
+        self.verbose = verbose
+        self.allow_model_selection = allow_model_selection
+        self.allow_code_synth = allow_code_synth
+        self.allow_token_reduction = allow_token_reduction
+        self.useParallelOps = useParallelOps
+
+    def execute(self,
         dataset: Set,
         policy: Policy,
-        num_samples: int=20,
-        nocache: bool=False,
-        include_baselines: bool=False,
-        min_plans: Optional[int] = None,
-        verbose: bool = False,
     ):
         # if nocache is True, make sure we do not re-use DSPy examples or codegen examples
-        if nocache:
+        if self.nocache:
             dspy_cache_dir = os.path.join(
                 os.path.expanduser("~"), "cachedir_joblib/joblib/dsp/"
             )
@@ -45,13 +66,22 @@ class Execute:
         uid = (
             dataset.universalIdentifier()
         )  # TODO: I think we may need to get uid from source?
-        run_sentinels = nocache or not DataDirectory().hasCachedAnswer(uid)
+        run_sentinels = self.nocache or not DataDirectory().hasCachedAnswer(uid)
 
         sentinel_plans, sample_execution_data, sentinel_records = [], [], []
         if run_sentinels:
             # initialize logical and physical planner
-            logical_planner = LogicalPlanner(nocache)
-            physical_planner = PhysicalPlanner(num_samples, scan_start_idx=0)
+            # NOTE The Exeuction class MUST KNOW THE PLANNER!
+            #  if I disallow code synth for my planning, I will have to disallow it for my execution. Now, I can't do that.
+            logical_planner = LogicalPlanner(self.nocache)
+            physical_planner = PhysicalPlanner(
+                num_samples=self.num_samples,
+                scan_start_idx=0,
+                allow_model_selection=self.allow_model_selection,
+                allow_code_synth=self.allow_code_synth,
+                allow_token_reduction=self.allow_token_reduction,
+                useParallelOps=self.useParallelOps,
+            )
 
             # get sentinel plans
             for logical_plan in logical_planner.generate_plans(dataset, sentinels=True):
@@ -59,20 +89,27 @@ class Execute:
                     sentinel_plans.append(sentinel_plan)
 
             # run sentinel plans
-            sample_execution_data, sentinel_records = cls.run_sentinel_plans(
-                sentinel_plans, verbose
+            sample_execution_data, sentinel_records = self.run_sentinel_plans(
+                sentinel_plans, self.verbose
             )
 
         # (re-)initialize logical and physical planner
-        scan_start_idx = num_samples if run_sentinels else 0
-        logical_planner = LogicalPlanner(nocache)
-        physical_planner = PhysicalPlanner(scan_start_idx=scan_start_idx)
+        scan_start_idx = self.num_samples if run_sentinels else 0
+        logical_planner = LogicalPlanner(self.nocache)
+        physical_planner = PhysicalPlanner(
+            num_samples=self.num_samples,
+            scan_start_idx=scan_start_idx,
+            allow_model_selection=self.allow_model_selection,
+            allow_code_synth=self.allow_code_synth,
+            allow_token_reduction=self.allow_token_reduction,
+            useParallelOps=self.useParallelOps,
+        )
 
         # NOTE: in the future we may use operator_estimates below to limit the number of plans
         #       that we need to consider during plan generation. I.e., we may be able to save time
         #       by pre-computing the set of viable models / execution strategies at each operator
         #       based on the sample execution data we get.
-        # 
+        #
         # enumerate all possible physical plans
         all_physical_plans = []
         for logical_plan in logical_planner.generate_plans(dataset):
@@ -92,68 +129,41 @@ class Execute:
         final_plans = physical_planner.select_pareto_optimal_plans(plans)
 
         # for experimental evaluation, we may want to include baseline plans
-        if include_baselines:
+        if self.include_baselines:
             final_plans = physical_planner.add_baseline_plans(final_plans)
 
-        if min_plans is not None and len(final_plans) < min_plans:
-            final_plans = physical_planner.add_plans_closest_to_frontier(final_plans, plans, min_plans)
+        if self.min_plans is not None and len(final_plans) < self.min_plans:
+            final_plans = physical_planner.add_plans_closest_to_frontier(final_plans, plans, self.min_plans)
 
         # choose best plan and execute it
         plan = policy.choose(plans)
-
-        # display the plan output
-        if verbose:
-            print("----------------------")
-            print(f"Final Plan:")
-            plan.printPlan()
-            print("---")
-
-        # run the plan
-        new_records, stats = cls.execute(plan) # TODO: Still WIP
-
+        new_records, stats = self.execute_plan(plan, plan_type="Final Plan") # TODO: Still WIP
         all_records = sentinel_records + new_records
 
         return all_records, plan, stats
 
-    @classmethod
-    def run_sentinel_plan(cls, plan: PhysicalPlan, plan_idx=0, verbose=False): 
-        # display the plan output
-        if verbose:
-            print("----------------------")
-            print(f"Sentinel Plan {plan_idx}:")
-            plan.printPlan()
-            print("---")
-
-        # run the plan
-        records, plan_stats = cls.execute(plan)
-
-        return records, plan_stats
-
-    @classmethod
     def run_sentinel_plans(
-        cls, sentinel_plans: List[PhysicalPlan], verbose: bool = False
+        self, sentinel_plans: List[PhysicalPlan], verbose: bool = False
     ):
         # compute number of plans
         num_sentinel_plans = len(sentinel_plans)
 
         all_sample_execution_data, return_records = [], []
         results = list(map(lambda x:
-                cls.run_sentinel_plan(*x),
-                [(plan, idx, verbose) for idx, plan in enumerate(sentinel_plans)],
+                self.execute_plan(*x),
+                [(plan, idx, "Sentinel Plan") for idx, plan in enumerate(sentinel_plans)],
             )
         )
         # with ThreadPoolExecutor(max_workers=num_sentinel_plans) as executor:
         #     results = list(executor.map( lambda x:
-        #             cls.run_sentinel_plan(*x),
-        #             [(plan, idx, verbose) for idx, plan in enumerate(sentinel_plans)],
+        #             self.run_sentinel_plan(*x),
+        #             [(plan, idx, "Sentinel Plan") for idx, plan in enumerate(sentinel_plans)],
         #         )
         #     )
-        print("Finished executing sentinel plans")
-        # write out result dict and samples collected for each sentinel
         sentinel_records, sentinel_stats = zip(*results)
         for records, plan_stats, plan in zip(sentinel_records, sentinel_stats, sentinel_plans):
             # aggregate sentinel est. data
-            sample_execution_data = cls.getSampleExecutionData(plan_stats)
+            sample_execution_data = self.getSampleExecutionData(plan_stats)
             all_sample_execution_data.extend(sample_execution_data)
 
             # set return_records to be records from champion model
@@ -165,8 +175,7 @@ class Execute:
 
         return all_sample_execution_data, return_records # TODO: make sure you capture cost of sentinel plans.
 
-    @classmethod
-    def execute_dag(cls, plan: PhysicalPlan, plan_stats: PlanStats):
+    def execute_dag(self, plan: PhysicalPlan, plan_stats: PlanStats):
         """
         Helper function which executes the physical plan. This function is overly complex for today's
         plans which are simple cascades -- but is designed with an eye towards 
@@ -180,7 +189,23 @@ class Execute:
             op_id = operator.get_op_id()
             # TODO: Is it okay to have call return a list?
             if isinstance(operator, DataSourcePhysicalOperator):
-                out_records, record_op_stats_lst = operator()
+                idx=0
+                out_records, record_op_stats_lst = [], []
+                num_samples = self.num_samples if self.num_samples else float("inf")
+
+                ds = operator.datadir.getRegisteredDataset(plan.datasetIdentifier)
+                for filename in sorted(os.listdir(ds.path)):
+                    file_path = os.path.join(ds.path, filename)
+                    if os.path.isfile(file_path):
+                        if idx > num_samples:
+                            break
+                        candidate = {"path": file_path, 
+                                     "idx": idx}
+                        record, record_op_stats = operator(candidate)
+                        out_records.append(record)
+                        record_op_stats_lst.append(record_op_stats)
+                        # Incrementing here bc folder may contain subfolders
+                        idx += 1 
             else:
                 input_records = out_records
                 out_records = []
@@ -211,13 +236,10 @@ class Execute:
                 x.total_op_cost += record_op_stats.op_cost
                 plan_stats.operator_stats[op_id] = x
 
-
         return out_records, plan_stats
 
-
-    #TODO The dag style execution is not really working. I am implementing a per-records execution
-    @classmethod
-    def _todebug_execute_dag(cls, plan: PhysicalPlan, plan_stats: PlanStats):
+    # TODO The dag style execution is not really working. I am implementing a per-records execution
+    def _todebug_execute_dag(self, plan: PhysicalPlan, plan_stats: PlanStats):
         """
         Helper function which executes the physical plan. This function is overly complex for today's
         plans which are simple cascades -- but is designed with an eye towards 
@@ -248,7 +270,6 @@ class Execute:
                     records, record_op_stats = operator(input_record)
                     record_op_stats_lst = [record_op_stats]
 
-
                 # update plan stats
                 for record_op_stats in record_op_stats_lst:
                     # TODO code a nice __add__ function for OperatorStats and RecordOpStats
@@ -257,7 +278,6 @@ class Execute:
                     x.total_op_time += record_op_stats.op_time
                     x.total_op_cost += record_op_stats.op_cost
                     plan_stats.operator_stats[op_id] = x
-
 
                 # get id for next physical operator (currently just next op in plan.operators)
                 next_op_id = (
@@ -296,9 +316,17 @@ class Execute:
 
         return output_records, plan_stats
 
-    @classmethod
-    def execute(cls, plan: PhysicalPlan):
+    # NOTE: Adding a few optional arguments for printing, etc.
+    def execute_plan(self, plan: PhysicalPlan,
+                     plan_idx: int = None,
+                     plan_type: str = None,):
         """Initialize the stats and invoke _execute_dag() to execute the plan."""
+        if self.verbose:
+            print("----------------------")
+            print(f"{plan_type} {str(plan_idx)}:")
+            plan.printPlan()
+            print("---")
+
         plan_start_time = time.time()
 
         # initialize plan and operator stats
@@ -311,7 +339,7 @@ class Execute:
         #       Thus, the implementation is overkill for today's plans, but hopefully this will
         #       avoid the need for a lot of refactoring in the future.
         # execute the physical plan;
-        output_records, plan_stats = cls.execute_dag(plan, plan_stats)
+        output_records, plan_stats = self.execute_dag(plan, plan_stats)
 
         # finalize plan stats
         total_plan_time = time.time() - plan_start_time
@@ -319,10 +347,7 @@ class Execute:
 
         return output_records, plan_stats
 
-    # MR: per my limited understanding of staticmethods vs. classmethods, since this fcn.
-    #     accepts cls as an argument I think it's supposed to be a classmethod?
-    @classmethod
-    def getSampleExecutionData(cls, plan_stats: PlanStats) -> List[SampleExecutionData]:
+    def getSampleExecutionData(self, plan_stats: PlanStats) -> List[SampleExecutionData]:
         """Compute and return all sample execution data collected by this plan so far."""
         # construct table of observation data from sample batch of processed records
         sample_execution_data, source_op_id = [], None
@@ -371,7 +396,6 @@ class Execute:
                             answer[field] = record_op_stats.record_state[field]
                     observation_arguments["answer"] = answer
 
-
                 if record_op_stats.record_state is not None:
                     observation_arguments.update({
                     "total_input_tokens": (
@@ -416,3 +440,35 @@ class Execute:
             source_op_id = op_id
 
         return sample_execution_data
+
+class Execute:
+    def __new__(
+        cls,
+        dataset: Set,
+        policy: Policy,
+        num_samples: int=20,
+        nocache: bool=False,
+        include_baselines: bool=False,
+        min_plans: Optional[int] = None,
+        verbose: bool = False,
+        allow_model_selection: Optional[bool]=True,
+        allow_code_synth: Optional[bool]=True,
+        allow_token_reduction: Optional[bool]=True,
+        useParallelOps: Optional[bool]=False,
+        execution_engine: ExecutionEngine = SimpleExecution,
+    ):
+
+        return execution_engine(
+            num_samples=num_samples,
+            nocache=nocache,
+            include_baselines=include_baselines,
+            min_plans=min_plans,
+            verbose=verbose,
+            allow_code_synth=allow_code_synth,
+            allow_model_selection=allow_model_selection,
+            allow_token_reduction=allow_token_reduction,
+            useParallelOps=useParallelOps
+        ).execute(
+            dataset=dataset,
+            policy=policy
+        )
