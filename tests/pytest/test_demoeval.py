@@ -20,12 +20,10 @@ def test_enron(enron_eval):
     """Test the enron demo"""
     dataset = enron_eval
     logical = LogicalPlanner()
-    physical = PhysicalPlanner(allow_code_synth=False,
-)
+    physical = PhysicalPlanner(allow_code_synth=False,)
 
     plans = logical.generate_plans(dataset)
     lp = plans[0]
-    print(lp)
     physicalPlans = physical.generate_plans(lp)
     pp = physicalPlans[0]
     print(pp)
