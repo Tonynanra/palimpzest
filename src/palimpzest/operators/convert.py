@@ -500,7 +500,7 @@ class LLMConvert(ConvertOp):
                 cost_per_record=stats["cost_per_record"],
                 model_name=self.model.value,
                 input_fields=self.inputSchema.fieldNames(),
-                generated_fields=stats["generated_field_names"],
+                generated_fields=stats["generated_fields"],
                 total_input_tokens=stats["total_input_tokens"],
                 total_output_tokens=stats["total_output_tokens"],
                 total_input_cost=stats["total_input_cost"],
@@ -975,6 +975,7 @@ class LLMConvert(ConvertOp):
 
             # generate all fields in a single query
             final_json_objects, query_stats = self._dspy_generate_fields(generate_field_names, **dspy_generate_fields_kwargs)
+            print("Query stats usage", query_stats["usage"])
 
             # if there was an error, execute a conventional query
             if all([v is None for v in final_json_objects[0].values()]):
@@ -985,7 +986,11 @@ class LLMConvert(ConvertOp):
 
                     # update query_stats
                     for key, value in field_stats.items():
-                        query_stats[key] += value
+                        if type(value) == type(dict()):
+                            for k, v in value.items():
+                                query_stats[key][k] = query_stats[key].get(k,0) + value[k]
+                        else:
+                            query_stats[key] += value
 
                     # update field_outputs
                     field_outputs[field_name] = json_objects
@@ -1007,7 +1012,7 @@ class LLMConvert(ConvertOp):
                 for idx in range(field_max_outputs):
                     output_fields_dict = {}
                     for field_name, json_objects in field_outputs.items():
-                        output_fields_dict[field_name] = json_objects[field_name][idx]
+                        output_fields_dict[field_name] = json_objects[idx][field_name]
 
                     final_json_objects.append(output_fields_dict)
 
