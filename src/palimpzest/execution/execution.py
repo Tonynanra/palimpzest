@@ -66,6 +66,7 @@ class SimpleExecution(ExecutionEngine):
             min_plans: Optional[int] = None,
             verbose: bool = False,
             available_models: Optional[List[Model]] = [],
+            allow_bonded_query: Optional[List[Model]] = True,
             allow_model_selection: Optional[bool]=True,
             allow_code_synth: Optional[bool]=True,
             allow_token_reduction: Optional[bool]=True,
@@ -82,6 +83,7 @@ class SimpleExecution(ExecutionEngine):
         if not available_models:
             self.available_models = getModels()
         self.allow_model_selection = allow_model_selection
+        self.allow_bonded_query = allow_bonded_query
         self.allow_code_synth = allow_code_synth
         self.allow_token_reduction = allow_token_reduction
         self.useParallelOps = useParallelOps
@@ -133,6 +135,7 @@ class SimpleExecution(ExecutionEngine):
             num_samples=self.num_samples,
             scan_start_idx=0,
             available_models=self.available_models,
+            allow_bonded_query=self.allow_bonded_query,
             allow_model_selection=self.allow_model_selection,
             allow_code_synth=self.allow_code_synth,
             allow_token_reduction=self.allow_token_reduction,
@@ -467,6 +470,7 @@ class Execute:
         min_plans: Optional[int] = None,
         verbose: bool = False,
         available_models: Optional[List[Model]] = [],
+        allow_bonded_query: Optional[List[Model]] = [],
         allow_model_selection: Optional[bool]=True,
         allow_code_synth: Optional[bool]=True,
         allow_token_reduction: Optional[bool]=True,
@@ -483,6 +487,7 @@ class Execute:
             min_plans=min_plans,
             verbose=verbose,
             available_models=available_models,
+            allow_bonded_query=allow_bonded_query,
             allow_code_synth=allow_code_synth,
             allow_model_selection=allow_model_selection,
             allow_token_reduction=allow_token_reduction,
