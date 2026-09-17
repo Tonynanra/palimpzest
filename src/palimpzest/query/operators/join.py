@@ -9,6 +9,7 @@ import numpy as np
 from litellm import embedding as litellm_embedding
 from numpy.linalg import norm
 from PIL import Image, ImageFile
+
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 from pydantic.fields import FieldInfo
@@ -22,18 +23,23 @@ from palimpzest.constants import (
     PromptStrategy,
 )
 from palimpzest.core.elements.records import DataRecord, DataRecordSet
-from palimpzest.core.lib.schemas import AUDIO_FIELD_TYPES, IMAGE_FIELD_TYPES, ImageFilepath
+from palimpzest.core.lib.schemas import (
+    AUDIO_FIELD_TYPES,
+    IMAGE_FIELD_TYPES,
+    ImageFilepath,
+)
 from palimpzest.core.models import GenerationStats, OperatorCostEstimates, RecordOpStats
 from palimpzest.query.generators.generators import Generator
 from palimpzest.query.operators.physical import PhysicalOperator
 
 
 class Singleton:
-     def __new__(cls, *args, **kw):
-         if not hasattr(cls, '_instance'):
-             orig = super(Singleton, cls)  # noqa: UP008
-             cls._instance = orig.__new__(cls, *args, **kw)
-         return cls._instance
+    def __new__(cls, *args, **kw):
+        if not hasattr(cls, "_instance"):
+            orig = super(Singleton, cls)  # noqa: UP008
+            cls._instance = orig.__new__(cls, *args, **kw)
+        return cls._instance
+
 
 class Locks(Singleton):
     model = None
@@ -47,11 +53,16 @@ class Locks(Singleton):
                 cls.model = SentenceTransformer(model_name)
             return cls.model
 
-def compute_similarity(left_embedding: list[float], right_embedding: list[float]) -> float:
+
+def compute_similarity(
+    left_embedding: list[float], right_embedding: list[float]
+) -> float:
     """
     Compute the similarity between two embeddings using cosine similarity.
     """
-    return np.dot(left_embedding, right_embedding) / (norm(left_embedding) * norm(right_embedding))
+    return np.dot(left_embedding, right_embedding) / (
+        norm(left_embedding) * norm(right_embedding)
+    )
 
 
 class JoinOp(PhysicalOperator, ABC):
@@ -67,7 +78,9 @@ class JoinOp(PhysicalOperator, ABC):
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
-        assert self.input_schema == self.output_schema, "Input and output schemas must match for JoinOp"
+        assert (
+            self.input_schema == self.output_schema
+        ), "Input and output schemas must match for JoinOp"
         self.condition = condition
         self.how = how
         self.on = on
@@ -119,7 +132,12 @@ class JoinOp(PhysicalOperator, ABC):
 
     def _compute_unmatched_records(self) -> DataRecordSet:
         """Helper function to compute unmatched records for left/right/outer joins."""
-        def join_unmatched_records(input_records: list[DataRecord] | list[tuple[DataRecord, list[float]]], joined_record_ids: set[str], left: bool = True):
+
+        def join_unmatched_records(
+            input_records: list[DataRecord] | list[tuple[DataRecord, list[float]]],
+            joined_record_ids: set[str],
+            left: bool = True,
+        ):
             records, record_op_stats_lst = [], []
             for record in input_records:
                 start_time = time.time()
@@ -128,7 +146,9 @@ class JoinOp(PhysicalOperator, ABC):
                     unmatched_dr = (
                         DataRecord.from_join_parents(self.output_schema, record, None)
                         if left
-                        else DataRecord.from_join_parents(self.output_schema, None, record)
+                        else DataRecord.from_join_parents(
+                            self.output_schema, None, record
+                        )
                     )
                     unmatched_dr._passed_operator = True
 
@@ -157,26 +177,51 @@ class JoinOp(PhysicalOperator, ABC):
 
         records, record_op_stats = [], []
         if self.how == "left":
-            records, record_op_stats = join_unmatched_records(self._left_input_records, self._left_joined_record_ids, left=True)
+            records, record_op_stats = join_unmatched_records(
+                self._left_input_records, self._left_joined_record_ids, left=True
+            )
 
         elif self.how == "right":
-            records, record_op_stats = join_unmatched_records(self._right_input_records, self._right_joined_record_ids, left=False)
+            records, record_op_stats = join_unmatched_records(
+                self._right_input_records, self._right_joined_record_ids, left=False
+            )
 
         elif self.how == "outer":
-            records, record_op_stats = join_unmatched_records(self._left_input_records, self._left_joined_record_ids, left=True)
-            right_records, right_record_op_stats = join_unmatched_records(self._right_input_records, self._right_joined_record_ids, left=False)
+            records, record_op_stats = join_unmatched_records(
+                self._left_input_records, self._left_joined_record_ids, left=True
+            )
+            right_records, right_record_op_stats = join_unmatched_records(
+                self._right_input_records, self._right_joined_record_ids, left=False
+            )
             records.extend(right_records)
             record_op_stats.extend(right_record_op_stats)
 
         return DataRecordSet(records, record_op_stats)
 
     @abstractmethod
-    def naive_cost_estimates(self, left_source_op_cost_estimates: OperatorCostEstimates, right_source_op_cost_estimates: OperatorCostEstimates) -> OperatorCostEstimates:
+    def naive_cost_estimates(
+        self,
+        left_source_op_cost_estimates: OperatorCostEstimates,
+        right_source_op_cost_estimates: OperatorCostEstimates,
+    ) -> OperatorCostEstimates:
         pass
 
     def set_finished(self):
         """Mark the operator as finished after computing left/right/outer join logic."""
         self.finished = True
+
+    def __call__(
+        self,
+        left_candidates: list[DataRecord],
+        right_candidates: list[DataRecord],
+        final: bool = False,
+        *args,
+        **kwargs,
+    ) -> tuple[DataRecordSet, int]:
+        raise NotImplementedError(
+            "JoinOp subclasses must implement the __call__ method"
+        )
+
 
 class RelationalJoin(JoinOp):
 
@@ -186,14 +231,15 @@ class RelationalJoin(JoinOp):
 
     def get_model_name(self):
         return None
-    
-    def _process_join_candidate_pair(self, left_candidate, right_candidate) -> tuple[DataRecord, RecordOpStats]:
+
+    def _process_join_candidate_pair(
+        self, left_candidate, right_candidate
+    ) -> tuple[DataRecord, RecordOpStats]:
         start_time = time.time()
 
         # determine whether or not the join was satisfied
         passed_operator = all(
-            left_candidate[field] == right_candidate[field]
-            for field in self.on
+            left_candidate[field] == right_candidate[field] for field in self.on
         )
 
         # handle different join types
@@ -206,7 +252,9 @@ class RelationalJoin(JoinOp):
             self._right_joined_record_ids.add(right_candidate._id)
 
         # compute output record and add to output_records
-        join_dr = DataRecord.from_join_parents(self.output_schema, left_candidate, right_candidate)
+        join_dr = DataRecord.from_join_parents(
+            self.output_schema, left_candidate, right_candidate
+        )
         join_dr._passed_operator = passed_operator
 
         # compute record stats and add to output_record_op_stats
@@ -231,13 +279,23 @@ class RelationalJoin(JoinOp):
 
         return join_dr, record_op_stats
 
-    def naive_cost_estimates(self, left_source_op_cost_estimates: OperatorCostEstimates, right_source_op_cost_estimates: OperatorCostEstimates):
+    def naive_cost_estimates(
+        self,
+        left_source_op_cost_estimates: OperatorCostEstimates,
+        right_source_op_cost_estimates: OperatorCostEstimates,
+    ):
         # estimate output cardinality using a constant assumption of the filter selectivity
         selectivity = NAIVE_EST_JOIN_SELECTIVITY
-        cardinality = selectivity * (left_source_op_cost_estimates.cardinality * right_source_op_cost_estimates.cardinality)
+        cardinality = selectivity * (
+            left_source_op_cost_estimates.cardinality
+            * right_source_op_cost_estimates.cardinality
+        )
 
         # estimate 1 ms execution time per input record pair
-        time_per_record = 0.001 * (left_source_op_cost_estimates.cardinality + right_source_op_cost_estimates.cardinality)
+        time_per_record = 0.001 * (
+            left_source_op_cost_estimates.cardinality
+            + right_source_op_cost_estimates.cardinality
+        )
 
         return OperatorCostEstimates(
             cardinality=cardinality,
@@ -246,7 +304,12 @@ class RelationalJoin(JoinOp):
             quality=1.0,
         )
 
-    def __call__(self, left_candidates: list[DataRecord], right_candidates: list[DataRecord], final: bool = False) -> tuple[DataRecordSet, int]:
+    def __call__(
+        self,
+        left_candidates: list[DataRecord],
+        right_candidates: list[DataRecord],
+        final: bool = False,
+    ) -> tuple[DataRecordSet, int]:
         # create the set of candidates to join
         join_candidates = []
         for candidate in left_candidates:
@@ -262,10 +325,12 @@ class RelationalJoin(JoinOp):
         output_records, output_record_op_stats = [], []
         with ThreadPoolExecutor(max_workers=self.join_parallelism) as executor:
             futures = [
-                executor.submit(self._process_join_candidate_pair, candidate, right_candidate)
+                executor.submit(
+                    self._process_join_candidate_pair, candidate, right_candidate
+                )
                 for candidate, right_candidate in join_candidates
             ]
-  
+
             # collect results as they complete
             for future in as_completed(futures):
                 self.join_idx += 1
@@ -280,7 +345,7 @@ class RelationalJoin(JoinOp):
         if self.retain_inputs:
             self._left_input_records.extend(left_candidates)
             self._right_input_records.extend(right_candidates)
-        
+
         # if this is the final call, then add in any left/right/outer join records that did not match
         if final:
             return self._compute_unmatched_records(), 0
@@ -289,8 +354,10 @@ class RelationalJoin(JoinOp):
         if len(output_records) == 0:
             return DataRecordSet([], []), num_inputs_processed
 
-        return DataRecordSet(output_records, output_record_op_stats), num_inputs_processed
-
+        return (
+            DataRecordSet(output_records, output_record_op_stats),
+            num_inputs_processed,
+        )
 
 
 class LLMJoin(JoinOp):
@@ -306,7 +373,14 @@ class LLMJoin(JoinOp):
         self.model = model
         self.prompt_strategy = prompt_strategy
         self.reasoning_effort = reasoning_effort
-        self.generator = Generator(model, prompt_strategy, reasoning_effort, Cardinality.ONE_TO_ONE, self.desc, self.verbose)
+        self.generator = Generator(
+            model,
+            prompt_strategy,
+            reasoning_effort,
+            Cardinality.ONE_TO_ONE,
+            self.desc,
+            self.verbose,
+        )
 
     def __str__(self):
         op = super().__str__()
@@ -347,8 +421,15 @@ class LLMJoin(JoinOp):
         start_time = time.time()
 
         # generate output; NOTE: FieldInfo is used to indicate the output type; thus, the desc is not needed
-        fields = {"passed_operator": FieldInfo(annotation=bool, description="Whether the records satisfy the join condition")}
-        field_answers, _, generation_stats, _ = self.generator(left_candidate, fields, right_candidate=right_candidate, **gen_kwargs)
+        fields = {
+            "passed_operator": FieldInfo(
+                annotation=bool,
+                description="Whether the records satisfy the join condition",
+            )
+        }
+        field_answers, _, generation_stats, _ = self.generator(
+            left_candidate, fields, right_candidate=right_candidate, **gen_kwargs
+        )
 
         # determine whether or not the join was satisfied
         passed_operator = field_answers["passed_operator"]
@@ -363,7 +444,9 @@ class LLMJoin(JoinOp):
             self._right_joined_record_ids.add(right_candidate._id)
 
         # compute output record and add to output_records
-        join_dr = DataRecord.from_join_parents(self.output_schema, left_candidate, right_candidate)
+        join_dr = DataRecord.from_join_parents(
+            self.output_schema, left_candidate, right_candidate
+        )
         join_dr._passed_operator = passed_operator
 
         # compute record stats and add to output_record_op_stats
@@ -397,10 +480,24 @@ class LLMJoin(JoinOp):
 
         return join_dr, record_op_stats
 
+    def __call__(
+        self,
+        left_candidates: list[DataRecord],
+        right_candidates: list[DataRecord],
+        final: bool = False,
+    ) -> tuple[DataRecordSet, int]:
+        raise NotImplementedError(
+            "LLMJoin subclasses must implement the __call__ method"
+        )
+
 
 class NestedLoopsJoin(LLMJoin):
 
-    def naive_cost_estimates(self, left_source_op_cost_estimates: OperatorCostEstimates, right_source_op_cost_estimates: OperatorCostEstimates):
+    def naive_cost_estimates(
+        self,
+        left_source_op_cost_estimates: OperatorCostEstimates,
+        right_source_op_cost_estimates: OperatorCostEstimates,
+    ):
         # estimate number of input tokens from source
         est_num_input_tokens = 2 * NAIVE_EST_NUM_INPUT_TOKENS
         if self.is_image_op():
@@ -430,10 +527,13 @@ class NestedLoopsJoin(LLMJoin):
 
         # estimate output cardinality using a constant assumption of the filter selectivity
         selectivity = NAIVE_EST_JOIN_SELECTIVITY
-        cardinality = selectivity * (left_source_op_cost_estimates.cardinality * right_source_op_cost_estimates.cardinality)
+        cardinality = selectivity * (
+            left_source_op_cost_estimates.cardinality
+            * right_source_op_cost_estimates.cardinality
+        )
 
         # estimate quality of output based on the strength of the model being used
-        quality = (self.model.get_overall_score() / 100.0)
+        quality = self.model.get_overall_score() / 100.0
 
         return OperatorCostEstimates(
             cardinality=cardinality,
@@ -442,7 +542,12 @@ class NestedLoopsJoin(LLMJoin):
             quality=quality,
         )
 
-    def __call__(self, left_candidates: list[DataRecord], right_candidates: list[DataRecord], final: bool = False) -> tuple[DataRecordSet, int]:
+    def __call__(
+        self,
+        left_candidates: list[DataRecord],
+        right_candidates: list[DataRecord],
+        final: bool = False,
+    ) -> tuple[DataRecordSet, int]:
         # get the set of input fields from both records in the join
         input_fields = self.get_input_fields()
 
@@ -464,10 +569,15 @@ class NestedLoopsJoin(LLMJoin):
         output_records, output_record_op_stats = [], []
         with ThreadPoolExecutor(max_workers=self.join_parallelism) as executor:
             futures = [
-                executor.submit(self._process_join_candidate_pair, candidate, right_candidate, gen_kwargs)
+                executor.submit(
+                    self._process_join_candidate_pair,
+                    candidate,
+                    right_candidate,
+                    gen_kwargs,
+                )
                 for candidate, right_candidate in join_candidates
             ]
-  
+
             # collect results as they complete
             for future in as_completed(futures):
                 self.join_idx += 1
@@ -492,7 +602,10 @@ class NestedLoopsJoin(LLMJoin):
         if len(output_records) == 0:
             return DataRecordSet([], []), num_inputs_processed
 
-        return DataRecordSet(output_records, output_record_op_stats), num_inputs_processed
+        return (
+            DataRecordSet(output_records, output_record_op_stats),
+            num_inputs_processed,
+        )
 
 
 class EmbeddingJoin(LLMJoin):
@@ -511,11 +624,13 @@ class EmbeddingJoin(LLMJoin):
         self.embedding_model = embedding_model
 
         # compute whether all fields are text fields
-        self.text_only = all([
-            field.annotation not in IMAGE_FIELD_TYPES + AUDIO_FIELD_TYPES
-            for field_name, field in self.input_schema.model_fields.items()
-            if field_name.split(".")[-1] in self.get_input_fields()
-        ])
+        self.text_only = all(
+            [
+                field.annotation not in IMAGE_FIELD_TYPES + AUDIO_FIELD_TYPES
+                for field_name, field in self.input_schema.model_fields.items()
+                if field_name.split(".")[-1] in self.get_input_fields()
+            ]
+        )
         self.locks = Locks()
 
         # keep track of embedding costs that could not be amortized if no output records were produced
@@ -558,7 +673,11 @@ class EmbeddingJoin(LLMJoin):
 
         return op_params
 
-    def naive_cost_estimates(self, left_source_op_cost_estimates: OperatorCostEstimates, right_source_op_cost_estimates: OperatorCostEstimates):
+    def naive_cost_estimates(
+        self,
+        left_source_op_cost_estimates: OperatorCostEstimates,
+        right_source_op_cost_estimates: OperatorCostEstimates,
+    ):
         # estimate number of input tokens from source
         est_num_input_tokens = 2 * NAIVE_EST_NUM_INPUT_TOKENS
         if self.is_image_op():
@@ -575,14 +694,21 @@ class EmbeddingJoin(LLMJoin):
         )
 
         # get est. of conversion cost (in USD) per record from model card
-        model_conversion_usd_per_record = self.embedding_model.get_usd_per_input_token() * est_num_input_tokens
+        model_conversion_usd_per_record = (
+            self.embedding_model.get_usd_per_input_token() * est_num_input_tokens
+        )
 
         # estimate output cardinality using a constant assumption of the filter selectivity
         selectivity = NAIVE_EST_JOIN_SELECTIVITY
-        cardinality = selectivity * (left_source_op_cost_estimates.cardinality * right_source_op_cost_estimates.cardinality)
+        cardinality = selectivity * (
+            left_source_op_cost_estimates.cardinality
+            * right_source_op_cost_estimates.cardinality
+        )
 
         # estimate quality of output based on the strength of the model being used
-        quality = (self.model.get_overall_score() / 100.0) * self.naive_quality_adjustment
+        quality = (
+            self.model.get_overall_score() / 100.0
+        ) * self.naive_quality_adjustment
 
         return OperatorCostEstimates(
             cardinality=cardinality,
@@ -591,8 +717,10 @@ class EmbeddingJoin(LLMJoin):
             quality=quality,
         )
 
-    def _compute_embeddings(self, candidates: list[DataRecord], input_fields: list[str]) -> tuple[np.ndarray, GenerationStats]:
-        # return empty array and empty stats if no candidates  
+    def _compute_embeddings(
+        self, candidates: list[DataRecord], input_fields: list[str]
+    ) -> tuple[np.ndarray, GenerationStats]:
+        # return empty array and empty stats if no candidates
         if len(candidates) == 0:
             return np.zeros((0, 512)), GenerationStats()
 
@@ -600,13 +728,22 @@ class EmbeddingJoin(LLMJoin):
         total_embedding_input_tokens = 0
         embeddings = None
         if self.text_only:
-            inputs = [dr.to_json_str(bytes_to_str=True, project_cols=input_fields, sorted=True) for dr in candidates]
+            inputs = [
+                dr.to_json_str(
+                    bytes_to_str=True, project_cols=input_fields, sorted=True
+                )
+                for dr in candidates
+            ]
             response = litellm_embedding(input=inputs, model=self.embedding_model.value)
-            total_embedding_input_tokens = response.usage.total_tokens if response.usage is not None else 0
-            embeddings = np.array([item['embedding'] for item in response.data])
+            total_embedding_input_tokens = (
+                response.usage.total_tokens if response.usage is not None else 0
+            )
+            embeddings = np.array([item["embedding"] for item in response.data])
         else:
             model = self.locks.get_model(self.embedding_model.value)
-            embeddings = np.zeros((len(candidates), 512))  # CLIP embeddings are 512-dimensional
+            embeddings = np.zeros(
+                (len(candidates), 512)
+            )  # CLIP embeddings are 512-dimensional
             num_input_fields_present = 0
             for field in input_fields:
                 field_inputs = []
@@ -619,7 +756,7 @@ class EmbeddingJoin(LLMJoin):
                         field_inputs.append(Image.open(candidate[field]))
                     else:
                         field_inputs.append(str(candidate[field]))
-                
+
                 if len(field_inputs) > 0:
                     embeddings += model.encode(field_inputs, convert_to_numpy=True)
 
@@ -627,7 +764,10 @@ class EmbeddingJoin(LLMJoin):
             embeddings /= num_input_fields_present
 
         # compute cost of embedding(s)
-        total_embedding_cost = self.embedding_model.get_usd_per_input_token() * total_embedding_input_tokens
+        total_embedding_cost = (
+            self.embedding_model.get_usd_per_input_token()
+            * total_embedding_input_tokens
+        )
         embedding_gen_stats = GenerationStats(
             model_name=self.embedding_model.value,
             embedding_input_tokens=total_embedding_input_tokens,
@@ -639,13 +779,25 @@ class EmbeddingJoin(LLMJoin):
 
         return embeddings, embedding_gen_stats
 
-    def _process_join_candidate_pair(self, left_candidate, right_candidate, gen_kwargs, embedding_sim):
-        output_record, output_record_op_stats = super()._process_join_candidate_pair(left_candidate, right_candidate, gen_kwargs)
+    def _process_join_candidate_pair(
+        self, left_candidate, right_candidate, gen_kwargs, embedding_sim
+    ):
+        output_record, output_record_op_stats = super()._process_join_candidate_pair(
+            left_candidate, right_candidate, gen_kwargs
+        )
         return output_record, output_record_op_stats, embedding_sim
 
-    def _process_join_candidate_with_sim(self, left_candidate: DataRecord, right_candidate: DataRecord, embedding_sim: float, passed_operator: bool) -> tuple[DataRecord, RecordOpStats]:
+    def _process_join_candidate_with_sim(
+        self,
+        left_candidate: DataRecord,
+        right_candidate: DataRecord,
+        embedding_sim: float,
+        passed_operator: bool,
+    ) -> tuple[DataRecord, RecordOpStats]:
         # compute output record and add to output_records
-        join_dr = DataRecord.from_join_parents(self.output_schema, left_candidate, right_candidate)
+        join_dr = DataRecord.from_join_parents(
+            self.output_schema, left_candidate, right_candidate
+        )
         join_dr._passed_operator = passed_operator
 
         # handle different join types
@@ -678,14 +830,27 @@ class EmbeddingJoin(LLMJoin):
 
         return join_dr, record_op_stats, embedding_sim
 
-    def __call__(self, left_candidates: list[DataRecord], right_candidates: list[DataRecord], final: bool = False) -> tuple[DataRecordSet, int]:
+    def __call__(
+        self,
+        left_candidates: list[DataRecord],
+        right_candidates: list[DataRecord],
+        final: bool = False,
+    ) -> tuple[DataRecordSet, int]:
         # get the set of input fields from both records in the join
         input_fields = self.get_input_fields()
 
         # compute the embeding for each candidate
-        left_embeddings, left_embedding_gen_stats = self._compute_embeddings(left_candidates, input_fields)
-        right_embeddings, right_embedding_gen_stats = self._compute_embeddings(right_candidates, input_fields)
-        total_embedding_cost = left_embedding_gen_stats.cost_per_record + right_embedding_gen_stats.cost_per_record + self.residual_embedding_cost
+        left_embeddings, left_embedding_gen_stats = self._compute_embeddings(
+            left_candidates, input_fields
+        )
+        right_embeddings, right_embedding_gen_stats = self._compute_embeddings(
+            right_candidates, input_fields
+        )
+        total_embedding_cost = (
+            left_embedding_gen_stats.cost_per_record
+            + right_embedding_gen_stats.cost_per_record
+            + self.residual_embedding_cost
+        )
         self.residual_embedding_cost = 0.0
 
         # construct kwargs for generation
@@ -695,14 +860,18 @@ class EmbeddingJoin(LLMJoin):
         # create the set of candidates to join
         join_candidates = []
         for candidate, embedding in zip(left_candidates, left_embeddings):
-            for right_candidate, right_embedding in zip(right_candidates, right_embeddings):
+            for right_candidate, right_embedding in zip(
+                right_candidates, right_embeddings
+            ):
                 embedding_sim = compute_similarity(embedding, right_embedding)
                 join_candidates.append((candidate, right_candidate, embedding_sim))
             for right_candidate, right_embedding in self._right_input_records:
                 embedding_sim = compute_similarity(embedding, right_embedding)
                 join_candidates.append((candidate, right_candidate, embedding_sim))
         for candidate, embedding in self._left_input_records:
-            for right_candidate, right_embedding in zip(right_candidates, right_embeddings):
+            for right_candidate, right_embedding in zip(
+                right_candidates, right_embeddings
+            ):
                 embedding_sim = compute_similarity(embedding, right_embedding)
                 join_candidates.append((candidate, right_candidate, embedding_sim))
 
@@ -712,14 +881,22 @@ class EmbeddingJoin(LLMJoin):
         # draw samples until num_samples is reached
         with self.locks.exec_lock:
             if self.samples_drawn < self.num_samples:
-                samples_to_draw = min(self.num_samples - self.samples_drawn, len(join_candidates))
+                samples_to_draw = min(
+                    self.num_samples - self.samples_drawn, len(join_candidates)
+                )
                 join_candidate_samples = join_candidates[:samples_to_draw]
                 join_candidates = join_candidates[samples_to_draw:]
 
                 # apply the generator to each pair of candidates
                 with ThreadPoolExecutor(max_workers=self.join_parallelism) as executor:
                     futures = [
-                        executor.submit(self._process_join_candidate_pair, left_candidate, right_candidate, gen_kwargs, embedding_sim)
+                        executor.submit(
+                            self._process_join_candidate_pair,
+                            left_candidate,
+                            right_candidate,
+                            gen_kwargs,
+                            embedding_sim,
+                        )
                         for left_candidate, right_candidate, embedding_sim in join_candidate_samples
                     ]
 
@@ -727,7 +904,11 @@ class EmbeddingJoin(LLMJoin):
                     similarities, joined = [], []
                     for future in as_completed(futures):
                         self.join_idx += 1
-                        join_output_record, join_output_record_op_stats, embedding_sim = future.result()
+                        (
+                            join_output_record,
+                            join_output_record_op_stats,
+                            embedding_sim,
+                        ) = future.result()
                         output_records.append(join_output_record)
                         output_record_op_stats.append(join_output_record_op_stats)
                         similarities.append(embedding_sim)
@@ -735,17 +916,24 @@ class EmbeddingJoin(LLMJoin):
                         print(f"{self.join_idx} JOINED")
 
                     # sort join results by embedding similarity
-                    sorted_sim_join_tuples = sorted(zip(similarities, joined), key=lambda x: x[0])
+                    sorted_sim_join_tuples = sorted(
+                        zip(similarities, joined), key=lambda x: x[0]
+                    )
 
                     # compute threshold below which no records joined
                     for embedding_sim, records_joined in sorted_sim_join_tuples:
                         if records_joined:
                             break
-                        if not records_joined and embedding_sim > self.max_non_matching_sim:
+                        if (
+                            not records_joined
+                            and embedding_sim > self.max_non_matching_sim
+                        ):
                             self.max_non_matching_sim = embedding_sim
 
                     # compute threshold above which all records joined
-                    for embedding_sim, records_joined in reversed(sorted_sim_join_tuples):
+                    for embedding_sim, records_joined in reversed(
+                        sorted_sim_join_tuples
+                    ):
                         if not records_joined:
                             break
                         if records_joined and embedding_sim < self.min_matching_sim:
@@ -757,23 +945,49 @@ class EmbeddingJoin(LLMJoin):
 
         # process remaining candidates based on embedding similarity
         if len(join_candidates) > 0:
-             assert self.samples_drawn >= self.num_samples, "All samples should have been drawn before processing remaining candidates"
-             with ThreadPoolExecutor(max_workers=self.join_parallelism) as executor:
+            assert (
+                self.samples_drawn >= self.num_samples
+            ), "All samples should have been drawn before processing remaining candidates"
+            with ThreadPoolExecutor(max_workers=self.join_parallelism) as executor:
                 futures = []
                 for left_candidate, right_candidate, embedding_sim in join_candidates:
                     # if the embedding similarity is lower than the threshold below which no records joined,
                     # then we can skip the LLM call and mark the records as not joined
                     if embedding_sim < self.max_non_matching_sim:
-                        futures.append(executor.submit(self._process_join_candidate_with_sim, left_candidate, right_candidate, embedding_sim, passed_operator=False))
+                        futures.append(
+                            executor.submit(
+                                self._process_join_candidate_with_sim,
+                                left_candidate,
+                                right_candidate,
+                                embedding_sim,
+                                passed_operator=False,
+                            )
+                        )
 
                     # if the embedding similarity is higher than the threshold above which all records joined,
                     # then we can skip the LLM call and mark the records as joined
                     elif embedding_sim > self.min_matching_sim:
-                        futures.append(executor.submit(self._process_join_candidate_with_sim, left_candidate, right_candidate, embedding_sim, passed_operator=True))
+                        futures.append(
+                            executor.submit(
+                                self._process_join_candidate_with_sim,
+                                left_candidate,
+                                right_candidate,
+                                embedding_sim,
+                                passed_operator=True,
+                            )
+                        )
 
                     # otherwise, we will process the LLM call
                     else:
-                        futures.append(executor.submit(self._process_join_candidate_pair, left_candidate, right_candidate, gen_kwargs, embedding_sim))
+                        futures.append(
+                            executor.submit(
+                                self._process_join_candidate_pair,
+                                left_candidate,
+                                right_candidate,
+                                gen_kwargs,
+                                embedding_sim,
+                            )
+                        )
 
                     num_inputs_processed += 1
 
@@ -781,7 +995,9 @@ class EmbeddingJoin(LLMJoin):
                 similarities, joined = [], []
                 for future in as_completed(futures):
                     self.join_idx += 1
-                    join_output_record, join_output_record_op_stats, embedding_sim = future.result()
+                    join_output_record, join_output_record_op_stats, embedding_sim = (
+                        future.result()
+                    )
                     output_records.append(join_output_record)
                     output_record_op_stats.append(join_output_record_op_stats)
                     similarities.append(embedding_sim)
@@ -790,7 +1006,9 @@ class EmbeddingJoin(LLMJoin):
 
                 ### update thresholds if there are llm calls which incrementally squeeze the boundaries ###
                 # sort join results by embedding similarity
-                sorted_sim_join_tuples = sorted(zip(similarities, joined), key=lambda x: x[0])
+                sorted_sim_join_tuples = sorted(
+                    zip(similarities, joined), key=lambda x: x[0]
+                )
 
                 # potentially update threshold below which no records joined
                 for embedding_sim, records_joined in sorted_sim_join_tuples:
@@ -807,7 +1025,11 @@ class EmbeddingJoin(LLMJoin):
                         self.min_matching_sim = embedding_sim
 
         # amortize embedding costs over all output records and add to each record's op stats
-        amortized_embedding_cost = total_embedding_cost / len(output_record_op_stats) if len(output_record_op_stats) > 0 else 0.0
+        amortized_embedding_cost = (
+            total_embedding_cost / len(output_record_op_stats)
+            if len(output_record_op_stats) > 0
+            else 0.0
+        )
         for record_op_stats in output_record_op_stats:
             record_op_stats.cost_per_record += amortized_embedding_cost
 
@@ -825,4 +1047,7 @@ class EmbeddingJoin(LLMJoin):
             self.residual_embedding_cost = total_embedding_cost
             return DataRecordSet([], []), num_inputs_processed
 
-        return DataRecordSet(output_records, output_record_op_stats), num_inputs_processed
+        return (
+            DataRecordSet(output_records, output_record_op_stats),
+            num_inputs_processed,
+        )

@@ -346,7 +346,8 @@ class BasePlanStats(BaseModel):
     # dictionary whose values are OperatorStats objects;
     # PlanStats maps {full_op_id -> OperatorStats}
     # SentinelPlanStats maps {logical_op_id -> {full_op_id -> OperatorStats}}
-    operator_stats: dict[str, OperatorStats | dict[str, OperatorStats]] = Field(default_factory=dict)
+    # Here we keep a generic type for the values, and the subclasses will specify the type more precisely
+    operator_stats: dict[str, Any] = Field(default_factory=dict)
 
     # dictionary whose values are GenerationStats objects for validation;
     # only used by SentinelPlanStats
@@ -449,6 +450,9 @@ class PlanStats(BasePlanStats):
     """
     Subclass of BasePlanStats which captures statistics from the execution of a single PhysicalPlan.
     """
+    # precise subtyping 
+    operator_stats: dict[str, OperatorStats] = Field(default_factory=dict)
+
     @staticmethod
     def from_plan(plan) -> PlanStats:
         """
@@ -528,6 +532,9 @@ class SentinelPlanStats(BasePlanStats):
     """
     Subclass of BasePlanStats which captures statistics from the execution of a single SentinelPlan.
     """
+    # precise subtyping 
+    operator_stats: dict[str, dict[str, OperatorStats]] = Field(default_factory=dict)
+
     @staticmethod
     def from_plan(plan) -> SentinelPlanStats:
         """

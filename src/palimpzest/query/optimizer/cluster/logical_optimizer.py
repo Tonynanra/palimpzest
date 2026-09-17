@@ -187,6 +187,47 @@ class LogicalPlan:
     def __len__(self) -> int:
         return len(self.operators)
 
+    @property
+    def source_op_ids(self) -> dict[str, list[str]]:
+        """Return logical source operator ids for each logical operator."""
+        source_op_ids = {op_id: [] for op_id in self.operators}
+        for parent_op_id, child_op_ids in self.edges.items():
+            for child_op_id in child_op_ids:
+                source_op_ids[child_op_id].append(parent_op_id)
+
+        return {
+            op_id: sorted(parent_op_ids)
+            for op_id, parent_op_ids in source_op_ids.items()
+        }
+
+    @property
+    def topological_order(self) -> list[str]:
+        """Return logical operator ids in stable source-to-sink order."""
+        source_op_ids = self.source_op_ids
+        remaining_source_counts = {
+            op_id: len(parent_op_ids)
+            for op_id, parent_op_ids in source_op_ids.items()
+        }
+        ready_op_ids = sorted(
+            op_id for op_id, count in remaining_source_counts.items() if count == 0
+        )
+        topological_order = []
+
+        while len(ready_op_ids) > 0:
+            op_id = ready_op_ids.pop(0)
+            topological_order.append(op_id)
+
+            for child_op_id in sorted(self.edges.get(op_id, [])):
+                remaining_source_counts[child_op_id] -= 1
+                if remaining_source_counts[child_op_id] == 0:
+                    ready_op_ids.append(child_op_id)
+                    ready_op_ids.sort()
+
+        if len(topological_order) != len(self.operators):
+            raise ValueError("Unable to compute topological order for cyclic logical plan")
+
+        return topological_order
+
     @classmethod
     def from_dataset(cls, dataset: Dataset) -> LogicalPlan:
         """

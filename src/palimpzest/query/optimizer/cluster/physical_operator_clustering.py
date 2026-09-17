@@ -5,10 +5,14 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TypeAlias
+from typing import Optional, TypeAlias
 
 from palimpzest.constants import NAIVE_BYTES_PER_RECORD
-from palimpzest.core.models import OperatorCostEstimates
+from palimpzest.core.models import (
+    OperatorCostEstimates,
+    SentinelPlanStats,
+    OperatorStats,
+)
 from palimpzest.query.operators.aggregate import SemanticAggregate
 from palimpzest.query.operators.batched import BatchedFilter
 from palimpzest.query.operators.convert import LLMConvertBonded
@@ -19,7 +23,8 @@ from palimpzest.query.operators.critique_and_refine import (
 from palimpzest.query.operators.filter import LLMFilter
 from palimpzest.query.operators.image_filter import RescaledImageFilter
 from palimpzest.query.operators.join import EmbeddingJoin, JoinOp, NestedLoopsJoin
-from palimpzest.query.operators.logical import LogicalOperator
+from palimpzest.query.operators.logical import JoinOp as LogicalJoinOp
+from palimpzest.query.operators.logical import BaseScan, ContextScan, LogicalOperator
 from palimpzest.query.operators.mixture_of_agents import (
     MixtureOfAgentsConvert,
     MixtureOfAgentsFilter,
@@ -29,6 +34,11 @@ from palimpzest.query.operators.rag import RAGConvert, RAGFilter
 from palimpzest.query.operators.scan import MarshalAndScanDataOp
 from palimpzest.query.operators.split import SplitConvert, SplitFilter
 from palimpzest.query.operators.topk import TopKOp
+from palimpzest.query.optimizer.cluster.logical_optimizer import LogicalPlan
+from palimpzest.query.optimizer.cluster.physical_operator_registry import (
+    find_physical_candidates,
+)
+from palimpzest.query.optimizer_config import OptimizerConfig
 
 # One grouping layer in a manual cluster spec. The first tuple entry is the
 # display name; the second is either a physical operator attribute name or a
@@ -44,21 +54,20 @@ PhysicalOperatorClusterSpec: TypeAlias = dict[
 
 @dataclass
 class PhysicalOperatorCluster:
-    """Node in a hierarchy of physical operator candidates.
+    """A set of physical operator candidates, potentially stored within children clusters.
+    Leaf clusters only contain a single physical operator.
+    Parent clusters contain one or more children clusters, each of which may contain multiple physical operators.
 
     Every node represents the concrete physical operators in ``physical_ops``.
-    Leaf nodes also keep the per-physical-operator naive cost estimates in
-    ``physical_op_cost_estimates``. 
-    Internal nodes keep an averaged ``cost_estimates`` value computed from their children.
+    Clusters keep a ``cost_estimates`` object.
+    Parent clusters compute it averaging through the estimates of their children, while leaf clusters keep the estimates of their physical operators.
     """
 
     name: str
+    logical_op: LogicalOperator
     physical_ops: list[PhysicalOperator]
+    cost_estimates: OperatorCostEstimates
     children: list[PhysicalOperatorCluster] = field(default_factory=list)
-    cost_estimates: OperatorCostEstimates | None = None
-    physical_op_cost_estimates: dict[str, OperatorCostEstimates] = field(
-        default_factory=dict
-    )
 
     def __str__(self) -> str:
         """Render the cluster tree without listing concrete physical operators."""
@@ -85,10 +94,7 @@ class PhysicalOperatorCluster:
                 )
             else:
                 lines.append(f"{indent}{cluster.name}{cost_suffix}")
-                stack.extend(
-                    (child, depth + 1)
-                    for child in reversed(cluster.children)
-                )
+                stack.extend((child, depth + 1) for child in reversed(cluster.children))
 
         return "\n".join(lines)
 
@@ -159,10 +165,90 @@ MANUAL_PHYSICAL_OPERATOR_CLUSTER_SPEC: PhysicalOperatorClusterSpec = {
 class PhysicalOperatorClusteringStrategy:
     """Interface for alternative physical operator clustering methods."""
 
+    def initialize_clusters(
+        self,
+        logical_plan: LogicalPlan,
+        optimizer_config: OptimizerConfig,
+        optimization_stats: SentinelPlanStats,
+    ) -> dict[str, PhysicalOperatorCluster]:
+        """This method is given a logical plan, which is a DAG of logical operators,
+        and creates, for each of the logical operators, clusters of
+        physical operators that can implement the logical operator.
+        The method initializes the cost estimates for each physical operator within the clusters
+        based on the cardinalities and cost estimates of its source operators.
+        To do this, it has to know the full plan topology.
+
+        The method topologically walks the logical plan from source scans
+        to downstream consumers, passing each logical operator's source cluster
+        cost estimates into the clustering strategy. Base scans seed their
+        source estimate from ``len(datasource)``; context scans seed cardinality
+        ``1.0``; joins receive left and right source estimates.
+        """
+
+        # sources is keyed by logical operator ID and keeps the op id of the sources
+        source_ids = logical_plan.source_op_ids  # dict[str, list[str]]
+        op_clusters = {}
+        cost_estimates = {}
+        optimization_stats.operator_stats = {}
+
+        for op_id in logical_plan.topological_order:
+            logical_op = logical_plan.operators[op_id]
+            source_id = source_ids[op_id]
+            optimization_stats.operator_stats[op_id] = {}
+
+            if isinstance(logical_op, BaseScan):
+                source_estimates = [
+                    OperatorCostEstimates(
+                        cardinality=len(logical_op.datasource),  # type: ignore
+                        time_per_record=0.0,
+                        cost_per_record=0.0,
+                        quality=1.0,
+                    )
+                ]
+            elif isinstance(logical_op, ContextScan):
+                source_estimates = [
+                    OperatorCostEstimates(
+                        cardinality=1.0,
+                        time_per_record=0.0,
+                        cost_per_record=0.0,
+                        quality=1.0,
+                    )
+                ]
+            elif len(source_id) == 1:
+                source_estimates = [cost_estimates[source_id[0]]]
+            elif isinstance(logical_op, LogicalJoinOp):
+                if len(source_id) != 2:
+                    raise ValueError(f"Join op {op_id} has {len(source_id)} sources")
+                left, right = source_id
+                source_estimates = [cost_estimates[left], cost_estimates[right]]
+            else:
+                raise ValueError(f"Op {op_id} has {len(source_id)} source operators")
+
+            cluster = self.build_cluster(logical_op, optimizer_config, source_estimates)
+            op_clusters[op_id] = cluster
+            cost_estimates[op_id] = cluster.cost_estimates
+
+            for physical_op in op_clusters[op_id].physical_ops:
+                physical_op_id = physical_op.get_full_op_id()
+                optimization_stats.operator_stats[op_id][physical_op_id] = (
+                    OperatorStats(
+                        full_op_id=op_id,
+                        op_name=physical_op.op_name(),
+                        source_unique_logical_op_ids=source_ids[op_id],
+                        plan_id=optimization_stats.plan_id,
+                        op_details={
+                            key: str(value)
+                            for key, value in physical_op.get_id_params().items()
+                        },
+                    )
+                )
+
+        return op_clusters
+
     def build_cluster(
         self,
         logical_op: LogicalOperator,
-        physical_ops: list[PhysicalOperator],
+        optimizer_config: OptimizerConfig,
         source_op_cost_estimates: list[OperatorCostEstimates] | None = None,
     ) -> PhysicalOperatorCluster:
         """Build a cluster tree for one logical operator's physical candidates."""
@@ -199,23 +285,27 @@ class ManualPhysicalOperatorClusteringStrategy(PhysicalOperatorClusteringStrateg
     def build_cluster(
         self,
         logical_op: LogicalOperator,
-        physical_ops: list[PhysicalOperator],
+        optimizer_config: OptimizerConfig,
         source_op_cost_estimates: list[OperatorCostEstimates] | None = None,
     ) -> PhysicalOperatorCluster:
         """Cluster concrete physical operators for a single logical operator.
 
         The root node is named after the logical operator. Its first layer is
         the physical operator class, followed by dimensions from the manual
-        spec. Leaf nodes retain per-physical-operator naive estimates, and every
-        internal node receives averaged child estimates.
+        spec. Each concrete physical operator is stored as a leaf cluster with
+        its own cost estimate, and every parent receives averaged child estimates.
         """
+
+        physical_ops = find_physical_candidates(logical_op, optimizer_config)
         if source_op_cost_estimates is None:
-            source_op_cost_estimates = [OperatorCostEstimates(
-                cardinality=100,
-                time_per_record=0.0,
-                cost_per_record=0.0,
-                quality=1.0,
-            )]
+            source_op_cost_estimates = [
+                OperatorCostEstimates(
+                    cardinality=100,
+                    time_per_record=0.0,
+                    cost_per_record=0.0,
+                    quality=1.0,
+                )
+            ]
 
         op_to_cost_estimates = {}
         for op in physical_ops:
@@ -245,39 +335,31 @@ class ManualPhysicalOperatorClusteringStrategy(PhysicalOperatorClusteringStrateg
         ):
             dimensions = self.cluster_spec.get(op_class, [])
             dimension_children = self._build_dimension_clusters(
+                logical_op,
                 ops,
                 dimensions,
                 op_to_cost_estimates,
             )
-            if len(dimension_children) == 0:
-                cluster_cost_estimates = self._average_cost_estimates(
-                    [op_to_cost_estimates[op.get_full_op_id()] for op in ops]
-                )
-                physical_op_cost_estimates = {
-                    op.get_full_op_id(): op_to_cost_estimates[op.get_full_op_id()]
-                    for op in ops
-                }
-            else:
-                cluster_cost_estimates = self._average_cost_estimates(
-                    [
-                        child.cost_estimates
-                        for child in dimension_children
-                        if child.cost_estimates is not None
-                    ]
-                )
-                physical_op_cost_estimates = {}
+            cluster_cost_estimates = self._average_cost_estimates(
+                [
+                    child.cost_estimates
+                    for child in dimension_children
+                    if child.cost_estimates is not None
+                ]
+            )
             children.append(
                 PhysicalOperatorCluster(
                     name=op_class.__name__,
+                    logical_op=logical_op,
                     physical_ops=ops,
                     children=dimension_children,
                     cost_estimates=cluster_cost_estimates,
-                    physical_op_cost_estimates=physical_op_cost_estimates,
                 )
             )
 
         return PhysicalOperatorCluster(
             name=logical_op.logical_op_name(),
+            logical_op=logical_op,
             physical_ops=physical_ops,
             children=children,
             cost_estimates=self._average_cost_estimates(
@@ -291,13 +373,22 @@ class ManualPhysicalOperatorClusteringStrategy(PhysicalOperatorClusteringStrateg
 
     def _build_dimension_clusters(
         self,
+        logical_op: LogicalOperator,
         physical_ops: list[PhysicalOperator],
         dimensions: list[ClusterDimension],
         op_to_cost_estimates: dict[str, OperatorCostEstimates],
     ) -> list[PhysicalOperatorCluster]:
         """Recursively group operators by the remaining manual dimensions."""
         if len(dimensions) == 0:
-            return []
+            return [
+                PhysicalOperatorCluster(
+                    name=op.get_full_op_id(),
+                    logical_op=logical_op,
+                    physical_ops=[op],
+                    cost_estimates=op_to_cost_estimates[op.get_full_op_id()],
+                )
+                for op in sorted(physical_ops, key=lambda op: op.get_full_op_id())
+            ]
 
         dimension_name, accessor = dimensions[0]
         value_to_ops = defaultdict(list)
@@ -310,34 +401,25 @@ class ManualPhysicalOperatorClusteringStrategy(PhysicalOperatorClusteringStrateg
         children = []
         for value, ops in sorted(value_to_ops.items(), key=lambda item: str(item[0])):
             next_children = self._build_dimension_clusters(
+                logical_op,
                 ops,
                 dimensions[1:],
                 op_to_cost_estimates,
             )
-            if len(next_children) == 0:
-                cluster_cost_estimates = self._average_cost_estimates(
-                    [op_to_cost_estimates[op.get_full_op_id()] for op in ops]
-                )
-                physical_op_cost_estimates = {
-                    op.get_full_op_id(): op_to_cost_estimates[op.get_full_op_id()]
-                    for op in ops
-                }
-            else:
-                cluster_cost_estimates = self._average_cost_estimates(
-                    [
-                        child.cost_estimates
-                        for child in next_children
-                        if child.cost_estimates is not None
-                    ]
-                )
-                physical_op_cost_estimates = {}
+            cluster_cost_estimates = self._average_cost_estimates(
+                [
+                    child.cost_estimates
+                    for child in next_children
+                    if child.cost_estimates is not None
+                ]
+            )
             children.append(
                 PhysicalOperatorCluster(
                     name=f"{dimension_name}={value}",
+                    logical_op=logical_op,
                     physical_ops=ops,
                     children=next_children,
                     cost_estimates=cluster_cost_estimates,
-                    physical_op_cost_estimates=physical_op_cost_estimates,
                 )
             )
 
@@ -346,10 +428,8 @@ class ManualPhysicalOperatorClusteringStrategy(PhysicalOperatorClusteringStrateg
     def _average_cost_estimates(
         self,
         cost_estimates: list[OperatorCostEstimates],
-    ) -> OperatorCostEstimates | None:
+    ) -> OperatorCostEstimates:
         """Average every populated ``OperatorCostEstimates`` field independently."""
-        if len(cost_estimates) == 0:
-            return None
 
         averaged_fields = {}
         for field_name in OperatorCostEstimates.model_fields:
@@ -359,9 +439,7 @@ class ManualPhysicalOperatorClusteringStrategy(PhysicalOperatorClusteringStrateg
                 if getattr(cost_estimate, field_name) is not None
             ]
             averaged_fields[field_name] = (
-                sum(values) / len(values)
-                if len(values) > 0
-                else None
+                sum(values) / len(values) if len(values) > 0 else None
             )
 
         return OperatorCostEstimates(**averaged_fields)

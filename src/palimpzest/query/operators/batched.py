@@ -18,24 +18,28 @@ from palimpzest.query.operators.physical import PhysicalOperator
 
 
 class BatchedOperator(PhysicalOperator):
+    batch_size: int
+    flushed: bool
+    _buffer: list[DataRecord]
+    _buffer_lock: threading.Lock
+
+    def __init__(self, batch_size: int, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.batch_size = batch_size
+        self.flushed = False
+        self._buffer = []
+        self._buffer_lock = threading.Lock()
+
     def flush(self) -> DataRecordSet:
         raise NotImplementedError(
             "flush method must be implemented by BatchedOperator subclasses"
         )
 
+    def has_pending_batch(self) -> bool:
+        with self._buffer_lock:
+            return len(self._buffer) > 0
 
 class BatchedFilter(LLMFilter, BatchedOperator):
-    def __init__(
-        self,
-        batch_size: int,
-        *args,
-        **kwargs,
-    ):
-        super().__init__(*args, **kwargs)
-        self.batch_size = batch_size
-        self._buffer: list[DataRecord] = []
-        self._buffer_lock = threading.Lock()
-        self.flushed = False
 
     def get_id_params(self):
         id_params = super().get_id_params()
@@ -47,10 +51,6 @@ class BatchedFilter(LLMFilter, BatchedOperator):
 
     def set_flushed(self):
         self.flushed = True
-
-    def has_pending_batch(self) -> bool:
-        with self._buffer_lock:
-            return len(self._buffer) > 0
 
     def naive_cost_estimates(self, source_op_cost_estimates: OperatorCostEstimates):
         # estimate number of input tokens from source

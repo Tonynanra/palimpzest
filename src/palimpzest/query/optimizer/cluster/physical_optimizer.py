@@ -1,20 +1,18 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import time
-
 from palimpzest.constants import Cardinality
+from palimpzest.core.data.iter_dataset import IterDataset
 from palimpzest.core.elements.records import DataRecord, DataRecordSet
 from palimpzest.core.models import (
     GenerationStats,
     OperatorCostEstimates,
-    OperatorStats,
     PlanCost,
     SentinelPlanStats,
 )
 from palimpzest.query.operators.aggregate import AggregateOp
 from palimpzest.query.operators.batched import BatchedOperator
 from palimpzest.query.operators.convert import ConvertOp, LLMConvert
+from palimpzest.query.operators.distinct import DistinctOp
 from palimpzest.query.operators.filter import FilterOp, LLMFilter
 from palimpzest.query.operators.join import JoinOp as PhysicalJoinOp
 from palimpzest.query.operators.logical import BaseScan, ContextScan
@@ -30,12 +28,11 @@ from palimpzest.query.optimizer.cluster.physical_operator_clustering import (
     PhysicalOperatorClusteringStrategy,
 )
 from palimpzest.query.optimizer.cluster.physical_operator_selection import (
-    PhysicalOperatorSelector,
+    PhysicalOperatorSelection,
+    PhysicalOperatorSampler,
+    ProgressEvent,
 )
 
-from palimpzest.query.optimizer.cluster.physical_operator_registry import (
-    find_physical_candidates,
-)
 from palimpzest.query.optimizer.cluster.sampling_budget import (
     EqualClusterSamplingBudgetAllocator,
 )
@@ -79,125 +76,18 @@ class PhysicalOptimizer:
             else clustering_strategy
         )
 
-    def initialize_clusters(
-        self,
-        logical_plan: LogicalPlan,
-    ) -> dict[str, PhysicalOperatorCluster]:
-        """This method is given a logical plan, which is a DAG of logical operators, and
-        has access to all implemented physical operators.
-        The method creates, for each of the logical operators, clusters of
-        physical operators that can implement the logical operator.
-        The method initializes the cost estimates for each physical operator within the clusters based on the cardinalities and cost estimates of its source operators.
-
-        The method first instantiates flat candidates for every logical
-        operator. It then topologically walks the logical plan from source scans
-        to downstream consumers, passing each logical operator's source cluster
-        cost estimates into the clustering strategy. Base scans seed their
-        source estimate from ``len(datasource)``; context scans seed cardinality
-        ``1.0``; joins receive left and right source estimates.
-        """
-        op_candidates = {
-            op_id: find_physical_candidates(op, self.optimizer_config)
-            for op_id, op in logical_plan.operators.items()
-        }
-
-        # Store source information for each logical operator
-        operator_sources = {op_id: [] for op_id in logical_plan.operators}
-        for parent, children in logical_plan.edges.items():
-            for child in children:
-                operator_sources[child].append(parent)
-
-        # The goal of this block is to first obtain estimates for the scan operators and then propagate the estimates to the downstream operators.
-        remaining_source_counts = {
-            op_id: len(source_ids) for op_id, source_ids in operator_sources.items()
-        }
-        ready_operators = sorted(
-            op_id for op_id, count in remaining_source_counts.items() if count == 0
-        )
-        op_clusters = {}
-        op_cost_estimates = {}
-
-        while len(ready_operators) > 0:
-            logical_op_id = ready_operators.pop(0)
-            logical_op = logical_plan.operators[logical_op_id]
-            logical_source_op_ids = sorted(operator_sources[logical_op_id])
-
-            if isinstance(logical_op, BaseScan):
-                source_cost_estimates = [
-                    OperatorCostEstimates(
-                        cardinality=len(logical_op.datasource),
-                        time_per_record=0.0,
-                        cost_per_record=0.0,
-                        quality=1.0,
-                    )
-                ]
-            elif isinstance(logical_op, ContextScan):
-                source_cost_estimates = [
-                    OperatorCostEstimates(
-                        cardinality=1.0,
-                        time_per_record=0.0,
-                        cost_per_record=0.0,
-                        quality=1.0,
-                    )
-                ]
-            elif isinstance(logical_op, LogicalJoinOp):
-                if len(logical_source_op_ids) != 2:
-                    raise ValueError(
-                        f"Join logical op {logical_op_id} expected 2 source operators, "
-                        f"found {len(logical_source_op_ids)}"
-                    )
-                source_cost_estimates = [
-                    op_cost_estimates[logical_source_op_ids[0]],
-                    op_cost_estimates[logical_source_op_ids[1]],
-                ]
-
-            else:
-                if len(logical_source_op_ids) != 1:
-                    raise ValueError(
-                        f"Logical op {logical_op_id} expected 1 source operator, "
-                        f"found {len(logical_source_op_ids)}"
-                    )
-                source_cost_estimates = [op_cost_estimates[logical_source_op_ids[0]]]
-
-            cluster = self.clustering_strategy.build_cluster(
-                logical_op,
-                op_candidates[logical_op_id],
-                source_op_cost_estimates=source_cost_estimates,
-            )
-            if cluster.cost_estimates is None:
-                raise ValueError(
-                    f"Cluster for logical op {logical_op_id} has no cost estimates"
-                )
-
-            op_clusters[logical_op_id] = cluster
-            op_cost_estimates[logical_op_id] = cluster.cost_estimates
-
-            for child in sorted(logical_plan.edges.get(logical_op_id, [])):
-                remaining_source_counts[child] -= 1
-                if remaining_source_counts[child] == 0:
-                    ready_operators.append(child)
-                    ready_operators.sort()
-
-        if len(op_clusters) != len(logical_plan.operators):
-            raise ValueError(
-                "Unable to build physical operator clusters for cyclic logical plan"
-            )
-
-        return op_clusters
-
     def build_sampling_progress_plan(
         self,
         logical_plan: LogicalPlan,
         op_clusters: dict[str, PhysicalOperatorCluster],
-        source_op_ids: dict[str, list[str]],
-        topological_order: list[str],
     ) -> SentinelPlan:
         """Build a display-only sentinel plan for cluster sampling progress."""
+        source_op_ids = logical_plan.source_op_ids
         progress_plans = {}
-        for logical_op_id in topological_order:
+        for logical_op_id in logical_plan.topological_order:
             subplans = [
                 progress_plans[source_op_id]
-                for source_op_id in sorted(source_op_ids[logical_op_id])
+                for source_op_id in source_op_ids[logical_op_id]
             ]
             progress_plans[logical_op_id] = SentinelPlan(
                 op_clusters[logical_op_id].physical_ops,
@@ -205,254 +95,6 @@ class PhysicalOptimizer:
             )
 
         return progress_plans[logical_plan.root_op_id]
-
-    def sample_physical_operator_clusters(
-        self,
-        logical_plan: LogicalPlan,
-        op_clusters: dict[str, PhysicalOperatorCluster],
-        source_op_ids: dict[str, list[str]],
-        topological_order: list[str],
-        physical_operator_selector: PhysicalOperatorSelector,
-        logical_op_sample_budgets: dict[str, int],
-        validator: Validator | None = None,
-        optimization_stats: SentinelPlanStats | None = None,
-        progress_manager: ProgressManager | None = None,
-        progress_logical_op_ids: dict[str, str] | None = None,
-    ) -> None:
-        """Sample each logical operator cluster for the configured budget.
-
-        This method perform exploration/exploitationor over every
-        logical operator cluster in topological order, from root logical operator to leaves.
-        Each selected physical operator is executed on an actual sampled input record and the observed
-        runtime/cost statistics are recorded back into the selected cluster path.
-        """
-        sampled_records_by_logical_op_id: dict[str, list[DataRecord]] = {}
-        progress_total = sum(logical_op_sample_budgets.values())
-
-        for logical_op_id in topological_order:
-            logical_op = logical_plan.operators[logical_op_id]
-            cluster = op_clusters[logical_op_id]
-            logical_source_op_ids = sorted(source_op_ids[logical_op_id])
-            op_sample_budget = logical_op_sample_budgets.get(logical_op_id, 0)
-            progress_logical_op_id = (
-                progress_logical_op_ids.get(logical_op_id)
-                if progress_logical_op_ids is not None
-                else None
-            )
-
-            if isinstance(logical_op, BaseScan):
-                input_payloads = {
-                    record_idx: record_idx
-                    for record_idx in range(len(logical_op.datasource))
-                }
-            elif isinstance(logical_op, ContextScan):
-                input_payloads = {f"{logical_op_id}:context": None}
-            elif isinstance(logical_op, LogicalJoinOp):
-                left_records = sampled_records_by_logical_op_id.get(
-                    logical_source_op_ids[0], []
-                )
-                right_records = sampled_records_by_logical_op_id.get(
-                    logical_source_op_ids[1], []
-                )
-                input_payloads = {}
-                pair_idx = 0
-                for left_record in left_records:
-                    for right_record in right_records:
-                        input_payloads[
-                            f"{left_record._id}:{right_record._id}:{pair_idx}"
-                        ] = (left_record, right_record)
-                        pair_idx += 1
-            elif any(isinstance(op, AggregateOp) for op in cluster.physical_ops):
-                source_records = sampled_records_by_logical_op_id.get(
-                    logical_source_op_ids[0], []
-                )
-                input_payloads = (
-                    {f"{logical_op_id}:aggregate": source_records}
-                    if len(source_records) > 0
-                    else {}
-                )
-            elif len(logical_source_op_ids) == 1:
-                source_records = sampled_records_by_logical_op_id.get(
-                    logical_source_op_ids[0], []
-                )
-                input_payloads = {
-                    f"{record._id}:{record_idx}": record
-                    for record_idx, record in enumerate(source_records)
-                }
-            else:
-                input_payloads = {}
-
-            sampled_records_by_logical_op_id[logical_op_id] = []
-            if len(input_payloads) == 0:
-                if progress_manager is not None and progress_logical_op_id is not None:
-                    self.update_sampling_progress_total(
-                        progress_manager,
-                        progress_logical_op_id,
-                        0,
-                        progress_total,
-                        op_sample_budget,
-                    )
-                    progress_total -= op_sample_budget
-                continue
-
-            input_record_ids = list(input_payloads)
-            sampling_round_idx = 0
-            samples_drawn = 0
-            physical_operator_selector.total_sampling_rounds = op_sample_budget
-
-            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                while sampling_round_idx < op_sample_budget:
-                    selections = []
-                    while (
-                        sampling_round_idx < op_sample_budget
-                        and len(selections) < self.max_workers
-                    ):
-                        try:
-                            selection = physical_operator_selector.select_next_sample(
-                                cluster,
-                                input_record_ids,
-                                sampling_round_idx,
-                            )
-                        except ValueError:
-                            sampling_round_idx = op_sample_budget
-                            break
-
-                        physical_operator_selector.executed_physical_op_ids_by_record[
-                            selection.record_id
-                        ].add(selection.physical_op.get_full_op_id())
-                        selections.append((sampling_round_idx, selection))
-                        sampling_round_idx += 1
-
-                    if len(selections) == 0:
-                        break
-
-                    futures = {
-                        executor.submit(
-                            self.execute_and_score_physical_operator_sample,
-                            logical_op,
-                            selection.physical_op,
-                            input_payloads[selection.record_id],
-                            validator,
-                        ): (round_idx, selection)
-                        for round_idx, selection in selections
-                    }
-                    sample_results = []
-                    for future in as_completed(futures):
-                        round_idx, selection = futures[future]
-                        record_set, input_count, elapsed_time, validation_gen_stats = (
-                            future.result()
-                        )
-                        sample_results.append(
-                            (
-                                round_idx,
-                                selection,
-                                record_set,
-                                input_count,
-                                elapsed_time,
-                                validation_gen_stats,
-                            )
-                        )
-
-                    for (
-                        _,
-                        selection,
-                        record_set,
-                        input_count,
-                        elapsed_time,
-                        validation_gen_stats,
-                    ) in sorted(
-                        sample_results,
-                        key=lambda result: result[0],
-                    ):
-                        if input_count == 0:
-                            continue
-
-                        if optimization_stats is not None:
-                            optimization_stats.add_record_op_stats(
-                                logical_op_id,
-                                record_set.record_op_stats,
-                            )
-                            optimization_stats.add_validation_gen_stats(
-                                logical_op_id,
-                                validation_gen_stats,
-                            )
-
-                        # If this is a source operator, the cardinality is found in the cost estimates of the first cluster path node. Otherwise, the source cost estimates are found in the cost estimates of the source operator clusters.
-                        if len(logical_source_op_ids) == 0:
-                            source_cost_estimates = [
-                                selection.cluster_path[0].cost_estimates
-                            ]
-                        else:
-                            source_cost_estimates = [
-                                op_clusters[op_id].cost_estimates
-                                for op_id in logical_source_op_ids
-                            ]
-
-                        physical_op_id = selection.physical_op.get_full_op_id()
-                        naive_cost_estimates = selection.cluster_path[
-                            -1
-                        ].physical_op_cost_estimates[physical_op_id]
-                        estimate_cardinality_from_sample = isinstance(
-                            selection.physical_op,
-                            (
-                                ContextScanOp,
-                                ConvertOp,
-                                FilterOp,
-                                PhysicalJoinOp,
-                                ScanPhysicalOp,
-                            ),
-                        )
-                        observed_cost_estimates = self.estimate_sample_cost(
-                            record_set,
-                            input_count,
-                            source_cost_estimates,
-                            naive_cost_estimates,
-                            elapsed_time,
-                            estimate_cardinality_from_sample=estimate_cardinality_from_sample,
-                        )
-                        physical_operator_selector.record_execution(
-                            selection,
-                            observed_cost_estimates,
-                        )
-                        passed_records = [
-                            record
-                            for record in record_set.data_records
-                            if record._passed_operator
-                        ]
-                        sampled_records_by_logical_op_id[logical_op_id].extend(
-                            passed_records
-                        )
-
-                        if (
-                            progress_manager is not None
-                            and progress_logical_op_id is not None
-                        ):
-                            progress_cost = sum(
-                                stats.cost_per_record
-                                for stats in record_set.record_op_stats
-                            )
-                            progress_cost += validation_gen_stats.cost_per_record
-                            progress_manager.incr(
-                                progress_logical_op_id,
-                                1,
-                                display_text=(
-                                    f"{selection.physical_op.op_name()} "
-                                    f"({len(passed_records)} outputs)"
-                                ),
-                                total_cost=progress_cost,
-                            )
-                        samples_drawn += 1
-
-            if samples_drawn < op_sample_budget:
-                if progress_manager is not None and progress_logical_op_id is not None:
-                    self.update_sampling_progress_total(
-                        progress_manager,
-                        progress_logical_op_id,
-                        samples_drawn,
-                        progress_total,
-                        op_sample_budget,
-                    )
-                    progress_total -= op_sample_budget - samples_drawn
 
     def update_sampling_progress_total(
         self,
@@ -478,322 +120,24 @@ class PhysicalOptimizer:
         )
         progress_manager.live_display.refresh()
 
-    def execute_and_score_physical_operator_sample(
-        self,
-        logical_op,
-        physical_op: PhysicalOperator,
-        input_payload,
-        validator: Validator | None,
-    ) -> tuple[DataRecordSet, int, float, GenerationStats]:
-        """Execute one optimizer sample and score it with the validator if present."""
-        record_set, input_count, elapsed_time = self.execute_physical_operator_sample(
-            logical_op,
-            physical_op,
-            input_payload,
-        )
-        validation_gen_stats = self.score_sample_quality(
-            validator,
-            physical_op,
-            record_set,
-        )
-        return record_set, input_count, elapsed_time, validation_gen_stats
-
-    def execute_physical_operator_sample(
-        self,
-        logical_op,
-        physical_op: PhysicalOperator,
-        input_payload,
-    ) -> tuple[DataRecordSet, int, float]:
-        """Execute a copied physical operator on one sampled optimizer input."""
-        execution_op = physical_op.copy()
-        if isinstance(execution_op, PhysicalJoinOp):
-            execution_op._left_input_records = []
-            execution_op._right_input_records = []
-            execution_op._left_joined_record_ids = set()
-            execution_op._right_joined_record_ids = set()
-            execution_op.join_idx = 0
-            execution_op.finished = False
-        if isinstance(execution_op, BatchedOperator):
-            execution_op.flushed = False
-            execution_op._buffer = []
-        if hasattr(execution_op, "_distinct_seen"):
-            execution_op._distinct_seen = set()
-
-        start_time = time.time()
-        if isinstance(logical_op, BaseScan):
-            record_set = execution_op(input_payload)
-            input_count = 1
-            record_set.input = input_payload
-        elif isinstance(logical_op, ContextScan):
-            record_set = execution_op()
-            input_count = 1
-            record_set.input = input_payload
-        elif isinstance(execution_op, PhysicalJoinOp):
-            left_record, right_record = input_payload
-            record_set, input_count = execution_op([left_record], [right_record])
-            record_set.input = ([left_record], [right_record])
-        elif isinstance(execution_op, AggregateOp):
-            input_records = (
-                input_payload if isinstance(input_payload, list) else [input_payload]
-            )
-            record_set = execution_op(candidates=input_records)
-            input_count = len(input_records)
-            record_set.input = input_records
-        else:
-            record_set = execution_op(input_payload)
-            input_count = 1
-            if (
-                isinstance(execution_op, BatchedOperator)
-                and len(record_set) == 0
-                and execution_op.has_pending_batch()
-            ):
-                record_set = execution_op.flush()
-            if record_set.input is None:
-                record_set.input = input_payload
-
-        return record_set, input_count, time.time() - start_time
-
-    def score_sample_quality(
-        self,
-        validator: Validator | None,
-        physical_op: PhysicalOperator,
-        record_set: DataRecordSet,
-    ) -> GenerationStats:
-        """Populate sampled record qualities using the provided validator."""
-        if len(record_set.record_op_stats) == 0:
-            return GenerationStats()
-
-        if not isinstance(physical_op, (LLMConvert, LLMFilter, TopKOp, PhysicalJoinOp)):
-            for record_op_stats in record_set.record_op_stats:
-                record_op_stats.quality = 1.0
-            return GenerationStats()
-
-        if validator is None:
-            return GenerationStats()
-
-        if isinstance(physical_op, LLMConvert):
-            if len(record_set.data_records) == 0:
-                return GenerationStats()
-            fields = physical_op.generated_fields
-            input_record: DataRecord = record_set.input
-            if physical_op.cardinality is Cardinality.ONE_TO_ONE:
-                output = record_set.data_records[0].to_dict(project_cols=fields)
-                output_str = record_set.data_records[0].to_json_str(
-                    project_cols=fields,
-                    bytes_to_str=True,
-                    sorted=True,
-                )
-                full_hash = f"{hash(input_record)}{hash(output_str)}"
-                score, validation_gen_stats, _ = validator._score_map(
-                    physical_op,
-                    fields,
-                    input_record,
-                    output,
-                    full_hash,
-                )
-                record_set.record_op_stats[0].quality = score
-                return validation_gen_stats
-            else:
-                output = [
-                    data_record.to_dict(project_cols=fields)
-                    for data_record in record_set.data_records
-                ]
-                output_strs = [
-                    data_record.to_json_str(
-                        project_cols=fields,
-                        bytes_to_str=True,
-                        sorted=True,
-                    )
-                    for data_record in record_set.data_records
-                ]
-                full_hash = f"{hash(input_record)}{hash(tuple(sorted(output_strs)))}"
-                score, validation_gen_stats, _ = validator._score_flat_map(
-                    physical_op,
-                    fields,
-                    input_record,
-                    output,
-                    full_hash,
-                )
-                for record_op_stats in record_set.record_op_stats:
-                    record_op_stats.quality = score
-                return validation_gen_stats
-
-        if isinstance(physical_op, TopKOp):
-            if len(record_set.data_records) == 0:
-                return GenerationStats()
-            fields = physical_op.generated_fields
-            input_record: DataRecord = record_set.input
-            output = record_set.data_records[0].to_dict(project_cols=fields)
-            output_str = record_set.data_records[0].to_json_str(
-                project_cols=fields,
-                bytes_to_str=True,
-                sorted=True,
-            )
-            full_hash = f"{hash(input_record)}{hash(output_str)}"
-            score, validation_gen_stats, _ = validator._score_topk(
-                physical_op,
-                fields,
-                input_record,
-                output,
-                full_hash,
-            )
-            record_set.record_op_stats[0].quality = score
-            return validation_gen_stats
-
-        if isinstance(physical_op, LLMFilter):
-            validation_gen_stats = GenerationStats()
-            scoring_op = physical_op
-            if isinstance(physical_op, BatchedOperator):
-                op_params = physical_op.get_op_params()
-                op_params.pop("batch_size", None)
-                scoring_op = LLMFilter(**op_params)
-
-            filter_str = scoring_op.filter_obj.filter_condition
-            input_records = (
-                record_set.input
-                if isinstance(record_set.input, list)
-                else [record_set.input]
-            )
-            for input_record, data_record, record_op_stats in zip(
-                input_records,
-                record_set.data_records,
-                record_set.record_op_stats,
-                strict=True,
-            ):
-                output = data_record._passed_operator
-                full_hash = f"{filter_str}{hash(input_record)}"
-                score, sample_validation_gen_stats, _ = validator._score_filter(
-                    scoring_op,
-                    filter_str,
-                    input_record,
-                    output,
-                    full_hash,
-                )
-                validation_gen_stats += sample_validation_gen_stats
-                record_op_stats.quality = score
-            return validation_gen_stats
-
-        if isinstance(physical_op, PhysicalJoinOp):
-            validation_gen_stats = GenerationStats()
-            condition = physical_op.condition
-            left_records, right_records = record_set.input
-            record_idx = 0
-            for left_record in left_records:
-                for right_record in right_records:
-                    data_record = record_set.data_records[record_idx]
-                    output = data_record._passed_operator
-                    full_hash = f"{condition}{hash(left_record)}{hash(right_record)}"
-                    score, sample_validation_gen_stats, _ = validator._score_join(
-                        physical_op,
-                        condition,
-                        left_record,
-                        right_record,
-                        output,
-                        full_hash,
-                    )
-                    validation_gen_stats += sample_validation_gen_stats
-                    record_set.record_op_stats[record_idx].quality = score
-                    record_idx += 1
-            return validation_gen_stats
-
-        return GenerationStats()
-
-    def estimate_sample_cost(
-        self,
-        record_set: DataRecordSet,
-        input_count: int,
-        source_cost_estimates: list[OperatorCostEstimates],
-        naive_cost_estimates: OperatorCostEstimates,
-        elapsed_time: float,
-        estimate_cardinality_from_sample: bool = True,
-    ) -> OperatorCostEstimates:
-        """Convert sampled execution stats into operator cost estimates."""
-        input_count = max(input_count, 1)
-        record_op_stats = record_set.record_op_stats
-        total_time = sum(stats.time_per_record for stats in record_op_stats)
-        total_cost = sum(stats.cost_per_record for stats in record_op_stats)
-        output_count = sum(
-            record._passed_operator for record in record_set.data_records
-        )
-
-        input_cardinality = source_cost_estimates[0].cardinality
-        if len(source_cost_estimates) > 1:
-            right_source_cost_estimates = source_cost_estimates[1]
-            input_cardinality *= right_source_cost_estimates.cardinality
-
-        cardinality = naive_cost_estimates.cardinality
-        if estimate_cardinality_from_sample:
-            cardinality = (output_count / input_count) * input_cardinality
-
-        observed_qualities = [
-            stats.quality for stats in record_op_stats if stats.quality is not None
-        ]
-        quality = (
-            sum(observed_qualities) / len(observed_qualities)
-            if len(observed_qualities) > 0
-            else naive_cost_estimates.quality
-        )
-
-        return OperatorCostEstimates(
-            cardinality=cardinality,
-            time_per_record=(
-                total_time / input_count
-                if len(record_op_stats) > 0
-                else elapsed_time / input_count
-            ),
-            cost_per_record=(
-                total_cost / input_count
-                if len(record_op_stats) > 0
-                else naive_cost_estimates.cost_per_record
-            ),
-            quality=quality,
-        )
-
-    def select_physical_operators(
-        self,
-        op_clusters: dict[str, PhysicalOperatorCluster],
-        topological_order: list[str],
-        physical_operator_selector: PhysicalOperatorSelector,
-    ) -> tuple[
-        dict[str, PhysicalOperator],
-        dict[str, OperatorCostEstimates],
-    ]:
-        """Select one concrete physical operator for every logical operator."""
-        selected_physical_ops = {}
-        selected_op_cost_estimates = {}
-        for logical_op_id in topological_order:
-            physical_op, cost_estimates = (
-                physical_operator_selector.select_best_physical_operator(
-                    op_clusters[logical_op_id]
-                )
-            )
-            selected_physical_ops[logical_op_id] = physical_op
-            selected_op_cost_estimates[logical_op_id] = cost_estimates
-
-        return selected_physical_ops, selected_op_cost_estimates
-
     def build_physical_plan(
         self,
         logical_plan: LogicalPlan,
-        source_op_ids: dict[str, list[str]],
-        topological_order: list[str],
         selected_physical_ops: dict[str, PhysicalOperator],
         selected_op_cost_estimates: dict[str, OperatorCostEstimates],
     ) -> PhysicalPlan:
         """Assemble a ``PhysicalPlan`` from the selected physical operators."""
+        source_op_ids = logical_plan.source_op_ids
         physical_plans = {}
-        for logical_op_id in topological_order:
-            source_ids = sorted(source_op_ids[logical_op_id])
+        for logical_op_id in logical_plan.topological_order:
+            source_ids = source_op_ids[logical_op_id]
             subplans = [physical_plans[source_op_id] for source_op_id in source_ids]
             physical_op = selected_physical_ops[logical_op_id]
             op_cost_estimates = selected_op_cost_estimates[logical_op_id]
-            op_source_cost_estimates = []
-            op_right_source_cost_estimates = []
+
             if len(source_ids) == 0:
-                source_cost_estimates = op_source_cost_estimates[logical_op_id]
-                right_source_cost_estimates = op_right_source_cost_estimates[
-                    logical_op_id
-                ]
+                source_cost_estimates = selected_op_cost_estimates[logical_op_id]
+                right_source_cost_estimates = None
             elif len(source_ids) == 1:
                 source_cost_estimates = selected_op_cost_estimates[source_ids[0]]
                 right_source_cost_estimates = None
@@ -846,107 +190,122 @@ class PhysicalOptimizer:
     def optimize(
         self,
         logical_plan: LogicalPlan,
+        optimization_stats: SentinelPlanStats,
         validator: Validator | None = None,
-        optimization_stats: SentinelPlanStats | None = None,
     ) -> PhysicalPlan:
-        """Optimize a logical plan and return a physical plan.\
+        """Optimize a logical plan and return a physical plan.
 
-        First, the logical plan is clustered into physical operator candidates, and the overall sampling budget is allocated to each logical operator cluster. 
-        Then, each cluster is sampled according to the allocated budget, and the observed execution statistics are used to select the best physical operator for each logical operator. Finally, a physical plan is constructed from the selected physical operators and their cost estimates.    
-            
+        First, for each operator in the logical plan, we generate a clustering of all its physical operator candidates, and the overall sampling budget is allocated to each logical operator in the plan.
+        Then, each physical operator cluster is sampled according to the allocated budget, and the observed execution statistics are used to select the best physical operator for each logical operator.
+        Finally, a physical plan is constructed from the selected physical operators and their cost estimates.
+
         """
 
-        op_clusters = self.initialize_clusters(logical_plan)
+        source_op_ids = logical_plan.source_op_ids
+        topological_order = logical_plan.topological_order
 
-        logical_op_sample_budgets = self.budget_allocator.allocate(
-            topological_order,
-            op_clusters,
+        # op_clusters is a dict[str, PhysicalOperatorCluster], keyed by logical op id
+        op_clusters = self.clustering_strategy.initialize_clusters(
+            logical_plan, self.optimizer_config, optimization_stats
         )
-        allocated_sample_budget = sum(logical_op_sample_budgets.values())
 
-        if optimization_stats is not None:
-            optimization_stats.operator_stats = {}
-            for logical_op_id in topological_order:
-                optimization_stats.operator_stats[logical_op_id] = {}
-                for physical_op in op_clusters[logical_op_id].physical_ops:
-                    optimization_stats.operator_stats[logical_op_id][
-                        physical_op.get_full_op_id()
-                    ] = OperatorStats(
-                        full_op_id=physical_op.get_full_op_id(),
-                        op_name=physical_op.op_name(),
-                        source_unique_logical_op_ids=source_op_ids[logical_op_id],
-                        plan_id=optimization_stats.plan_id,
-                        op_details={
-                            key: str(value)
-                            for key, value in physical_op.get_id_params().items()
-                        },
-                    )
+        sample_budgets = self.budget_allocator(logical_plan)
 
+        # Logic to track progress
         progress_manager = None
         progress_logical_op_ids = {}
+
+        update_progress = lambda event: None  # Default no-op if progress is disabled
         if self.progress:
             progress_plan = self.build_sampling_progress_plan(
                 logical_plan,
                 op_clusters,
-                source_op_ids,
-                topological_order,
             )
             progress_manager = create_progress_manager(
                 progress_plan,
-                sample_budget=allocated_sample_budget,
+                sample_budget=sum(sample_budgets.values()),
                 sample_cost_budget=None,
                 progress=self.progress,
             )
-            for topo_idx, (progress_logical_op_id, _) in enumerate(progress_plan):
-                logical_op_id = topological_order[topo_idx]
-                unique_progress_logical_op_id = f"{topo_idx}-{progress_logical_op_id}"
+            for idx, (progress_logical_op_id, _) in enumerate(progress_plan):
+                logical_op_id = topological_order[idx]
+                unique_progress_logical_op_id = f"{idx}-{progress_logical_op_id}"
                 progress_logical_op_ids[logical_op_id] = unique_progress_logical_op_id
-                task = progress_manager.unique_logical_op_id_to_task.get(
+                task = progress_manager.unique_logical_op_id_to_task[
                     unique_progress_logical_op_id
-                )
+                ]
                 if task is not None:
                     progress_manager.op_progress.update(
                         task,
-                        total=logical_op_sample_budgets[logical_op_id],
+                        total=sample_budgets[logical_op_id],
                     )
 
             progress_manager.start()
-
+            def update_progress(event: ProgressEvent) -> None:
+                progress_manager.incr(
+                    progress_logical_op_ids[event.logical_op_id],
+                    event.samples_drawn,
+                    display_text=
+                        f"Sampling {event.samples_drawn}/{event.total_samples} for logical op {event.logical_op_id}"
+                    total_cost=event.incremental_cost
+                )
         try:
-            physical_operator_selector = PhysicalOperatorSelector(
+            sampler = PhysicalOperatorSampler(
                 policy=self.policy,
                 total_sampling_rounds=self.optimizer_config.sample_budget,
                 seed=self.optimizer_config.seed,
+                max_workers=self.max_workers
             )
 
-            self.sample_physical_operator_clusters(
-                logical_plan,
-                op_clusters,
-                source_op_ids,
-                topological_order,
-                physical_operator_selector,
-                logical_op_sample_budgets,
-                validator=validator,
-                optimization_stats=optimization_stats,
-                progress_manager=progress_manager,
-                progress_logical_op_ids=progress_logical_op_ids,
-            )
+            sampled_records_by_logical_op_id: dict[str, list[DataRecord]] = {}
+            progress_total = sum(sample_budgets.values())
+            source_op_ids = logical_plan.source_op_ids
+
+            results = {} # intermediate storage for data records results per op
+            estimates = {} # intermediate storage for cost estimates per op
+            for logical_op_id in logical_plan.topological_order:
+                logical_op = logical_plan.operators[logical_op_id]
+                cluster = op_clusters[logical_op_id]
+                source_id = source_op_ids[logical_op_id]
+                
+
+                input_records = results.get(source_id, [])
+
+                # If this is a source operator, the cardinality is found 
+                # in the cost estimates of the first cluster path node. 
+                # Otherwise, the source cost estimates are found in the cost estimates of the source operator clusters.
+                if len(source_id) == 0:
+                    input_estimates = [
+                        selection.cluster_path[0].cost_estimates
+                    ]
+                else:
+                    input_estimates = [estimates[source_id]]
+
+                records, estimates = sampler.sample_physical_operator_cluster(
+                    cluster,
+                    sample_budget=sample_budgets[logical_op_id],
+                    input_records=input_records,
+                    input_estimates=input_estimates,
+                    optimization_stats=optimization_stats,
+                    validator=validator,
+                    on_sample_completed=update_progress
+                )
+                results[logical_op_id] = records
+                estimates[logical_op_id] = estimates
         finally:
             if progress_manager is not None:
                 progress_manager.finish()
 
         selected_physical_ops, selected_op_cost_estimates = (
             self.select_physical_operators(
+                logical_plan,
                 op_clusters,
-                topological_order,
-                physical_operator_selector,
+                sampler,
             )
         )
 
         optimized_plan = self.build_physical_plan(
             logical_plan,
-            source_op_ids,
-            topological_order,
             selected_physical_ops,
             selected_op_cost_estimates,
         )
