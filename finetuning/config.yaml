@@ -1,0 +1,60 @@
+# Sample config for finetuning/cuad_qwen_benchmark.py
+# Usage:
+#   python finetuning/cuad_qwen_benchmark.py --config finetuning/config.yaml
+
+exp_name: cuad-qwen-openrouter-sample
+output_dir: opt-profiling-data
+
+dataset:
+  mode: cuad-chunk
+  data_dir: testdata/cuad-chunk
+
+split: train
+num_contracts: 200  # chunk-native rows when dataset.mode is cuad-chunk
+seed: 42
+job_mode: grouped
+verbose: true
+
+models:
+  - openrouter/qwen/qwen3-8b
+  - openrouter/qwen/qwen3-14b
+  - openrouter/qwen/qwen3-32b
+
+categories:
+  # If selected is omitted, the benchmark uses every category listed in the
+  # buckets below in easy -> medium -> hard order.
+  buckets:
+    easy:
+      - Document Name
+      - Parties
+      - Governing Law
+    medium:
+      - Non-Transferable License
+      - Termination for Convenience
+      - Anti-Assignment
+    hard:
+      - Uncapped Liability
+      - Covenant Not to Sue
+      - Competitive Restriction Exception
+
+  # Optional explicit override:
+  # selected:
+  #   - Document Name
+  #   - Parties
+  #   - Governing Law
+
+openrouter:
+  api_base: https://openrouter.ai/api/v1
+  api_key_env_var: OPENROUTER_API_KEY
+  # Optional request headers passed through pz.Model(..., extra_headers=...)
+  # extra_headers:
+  #   HTTP-Referer: https://example.com
+  #   X-Title: palimpzest-cuad-benchmark
+
+execution:
+  execution_strategy: parallel
+  optimizer_strategy: none
+  max_workers: 4096
+  reasoning_effort: disable
+  # progress defaults to the inverse of verbose when omitted.
+  # progress: false
