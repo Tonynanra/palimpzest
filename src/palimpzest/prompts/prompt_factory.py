@@ -385,7 +385,18 @@ class PromptFactory:
         if self.prompt_strategy.is_map_prompt() or self.prompt_strategy.is_agg_prompt():
             assert output_schema is not None, "Output schema must be provided for convert prompts."
 
-            for field_name in sorted(output_fields):
+            output_field_order = kwargs.get("output_field_order", "sorted")
+            if output_field_order == "sorted":
+                ordered_output_fields = sorted(output_fields)
+            elif output_field_order == "provided":
+                ordered_output_fields = list(output_fields)
+            else:
+                raise ValueError(
+                    "output_field_order must be either 'sorted' or 'provided', "
+                    f"got {output_field_order!r}"
+                )
+
+            for field_name in ordered_output_fields:
                 desc = output_schema.model_fields[field_name].description
                 output_fields_desc += f"- {field_name}: {'no description available' if desc is None else desc}\n"
 

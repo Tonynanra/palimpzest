@@ -14,6 +14,7 @@ dist/*
 .ragatouille
 plots/
 paper-imgs/
+.codex/*
 
 # testdata folders and archive files
 testdata/enron-tiny.csv
@@ -47,6 +48,7 @@ testdata/real-estate-eval-100.tar
 # evaluation
 old-eval-results/
 eval-results/
+finetuning/artifacts/
 
 testdata/enron-eval/*.txt
 

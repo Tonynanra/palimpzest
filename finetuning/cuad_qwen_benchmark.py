@@ -11,9 +11,9 @@ from uuid import uuid4
 import numpy as np
 import pandas as pd
 import yaml
-from dotenv import load_dotenv
 from cuad_demo import (
     CUADDataset,
+    build_cuad_query,
     compute_metrics,
     evaluate_entry,
     get_label_df,
@@ -22,8 +22,8 @@ from cuad_demo import (
     normalize_predictions_to_long,
     resolve_selected_categories,
     validate_category_names,
-    build_cuad_query,
 )
+from dotenv import load_dotenv
 
 import palimpzest as pz
 
@@ -36,6 +36,7 @@ class OpenRouterConfig:
     api_base: str = "https://openrouter.ai/api/v1"
     api_key_env_var: str = "OPENROUTER_API_KEY"
     extra_headers: dict[str, str] | None = None
+    provider: str = "openrouter"
 
 
 @dataclass(frozen=True)
@@ -65,6 +66,7 @@ class BenchmarkConfig:
     exp_name: str = "cuad-qwen-openrouter"
     run_id: str = field(default_factory=lambda: uuid4().hex[:8])
     verbose: bool = False
+    convert_mode: str = "separate-converts"
 
 
 @dataclass(frozen=True)
@@ -118,8 +120,17 @@ def load_benchmark_config(config_path: str | Path, verbose_override: bool | None
     data_dir_value = raw_config.get("data_dir") or raw_config.get("dataset", {}).get("data_dir")
     data_dir = Path(data_dir_value) if data_dir_value else None
 
-    openrouter = _parse_openrouter_config(raw_config.get("openrouter"))
+    endpoint_config = raw_config.get("openrouter")
+    endpoint_provider = "openrouter"
+    if endpoint_config is None and raw_config.get("endpoint") is not None:
+        endpoint_config = raw_config.get("endpoint")
+        endpoint_provider = str(endpoint_config.get("provider", "openai-compatible"))
+    openrouter = _parse_openrouter_config(endpoint_config, provider=endpoint_provider)
     execution = _parse_execution_config(raw_config.get("execution", {}))
+
+    convert_mode = raw_config.get("convert_mode", "separate-converts")
+    if convert_mode not in {"separate-converts", "one-convert"}:
+        raise ValueError("convert_mode must be 'separate-converts' or 'one-convert'")
 
     output_dir = Path(raw_config.get("output_dir", DEFAULT_OUTPUT_DIR))
     verbose = raw_config.get("verbose", False) if verbose_override is None else verbose_override
@@ -128,6 +139,7 @@ def load_benchmark_config(config_path: str | Path, verbose_override: bool | None
         difficulty_buckets=difficulty_buckets,
         category_to_difficulty=category_to_difficulty,
         job_mode=job_mode,
+        convert_mode=convert_mode,
         models=models,
         openrouter=openrouter,
         execution=execution,
@@ -150,9 +162,12 @@ def _reject_legacy_worker_config(raw_config: dict[str, Any]) -> None:
         raise ValueError("Config field 'nodes' is unsupported for the native pz runner")
 
 
-def _parse_openrouter_config(openrouter_config: dict[str, Any] | None) -> OpenRouterConfig:
+def _parse_openrouter_config(
+    openrouter_config: dict[str, Any] | None,
+    provider: str = "openrouter",
+) -> OpenRouterConfig:
     if not isinstance(openrouter_config, dict):
-        raise ValueError("Config field 'openrouter' must be defined for the native pz runner")
+        raise ValueError("Config field 'openrouter' or 'endpoint' must be defined for the native pz runner")
 
     api_base = openrouter_config.get("api_base", "https://openrouter.ai/api/v1")
     api_key_env_var = openrouter_config.get("api_key_env_var", "OPENROUTER_API_KEY")
@@ -172,6 +187,7 @@ def _parse_openrouter_config(openrouter_config: dict[str, Any] | None) -> OpenRo
         api_base=api_base.rstrip("/"),
         api_key_env_var=api_key_env_var,
         extra_headers=dict(extra_headers) if extra_headers else None,
+        provider=provider,
     )
 
 
@@ -277,9 +293,11 @@ def build_openrouter_model(config: BenchmarkConfig, model_id: str) -> pz.Model:
     load_dotenv(override=True)
     api_key = os.getenv(config.openrouter.api_key_env_var)
     if not api_key:
-        raise RuntimeError(
-            f"OpenRouter config requires {config.openrouter.api_key_env_var} to be set"
-        )
+        if config.openrouter.provider == "openrouter":
+            raise RuntimeError(
+                f"OpenRouter config requires {config.openrouter.api_key_env_var} to be set"
+            )
+        api_key = "fake-api-key"
 
     model_kwargs: dict[str, Any] = {"api_key": api_key}
     if config.openrouter.extra_headers:
@@ -312,7 +330,7 @@ def run_benchmark_job(config: BenchmarkConfig, job: BenchmarkJob) -> JobResult:
         dataset_mode=config.dataset_mode,
         data_dir=str(config.data_dir) if config.data_dir else None,
     )
-    query = build_cuad_query(dataset, "separate-converts", selected_categories=job.categories)
+    query = build_cuad_query(dataset, config.convert_mode, selected_categories=job.categories)
     data_record_collection = query.run(config=qp_config)
     predictions_wide = data_record_collection.to_df()
     predictions_long = normalize_predictions_to_long(
@@ -323,7 +341,7 @@ def run_benchmark_job(config: BenchmarkConfig, job: BenchmarkJob) -> JobResult:
             "model_id": job.model_id,
             "job_mode": job.job_mode,
             "run_kind": "native-pz",
-            "provider": "openrouter",
+            "provider": config.openrouter.provider,
             "api_base": config.openrouter.api_base,
             "execution_strategy": config.execution.execution_strategy,
             "max_workers": config.execution.max_workers,
@@ -348,6 +366,7 @@ def run_benchmark(config: BenchmarkConfig) -> dict[str, Any]:
         "Starting CUAD benchmark: "
         f"job_mode={config.job_mode}, models={len(config.models)}, "
         f"categories={len(config.selected_categories)}, jobs={len(jobs)}, "
+        f"convert_mode={config.convert_mode}, "
         f"rows={config.num_contracts}, dataset_mode={config.dataset_mode}, seed={config.seed}, "
         f"execution_strategy={config.execution.execution_strategy}, max_workers={config.execution.max_workers}"
     )
@@ -431,7 +450,7 @@ def write_outputs(
             },
             "job_mode": result.job.job_mode,
             "run_kind": "native-pz",
-            "provider": "openrouter",
+            "provider": config.openrouter.provider,
             "api_base": config.openrouter.api_base,
             "execution_strategy": result.execution_strategy,
             "max_workers": result.max_workers,
@@ -762,6 +781,7 @@ def build_resolved_run_metadata(config: BenchmarkConfig) -> dict[str, Any]:
         "run_id": config.run_id,
         "output_dir": str(build_output_dir(config)),
         "job_mode": config.job_mode,
+        "convert_mode": config.convert_mode,
         "dataset_mode": config.dataset_mode,
         "data_dir": str(config.data_dir) if config.data_dir else None,
         "benchmark_unit": "chunk" if config.dataset_mode == "cuad-chunk" else "contract",
@@ -776,6 +796,7 @@ def build_resolved_run_metadata(config: BenchmarkConfig) -> dict[str, Any]:
             "api_base": config.openrouter.api_base,
             "api_key_env_var": config.openrouter.api_key_env_var,
             "extra_headers": dict(config.openrouter.extra_headers or {}),
+            "provider": config.openrouter.provider,
         },
         "execution": {
             "execution_strategy": config.execution.execution_strategy,
