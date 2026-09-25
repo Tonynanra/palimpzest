@@ -1,5 +1,7 @@
+import json
 import logging
 import re
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -7,6 +9,7 @@ import requests
 logger = logging.getLogger(__name__)
 
 PZ_MODEL_DATA_URL = "https://palimpzest-research.s3.us-east-1.amazonaws.com/pz_models_information.json"
+LOCAL_MODEL_DATA_PATH = Path(__file__).with_name("pz_models_information.json")
 
 # Known MMLU-Pro scores (manually curated)
 # Keys should be canonical patterns that fuzzy matching will find
@@ -477,10 +480,17 @@ class ModelMetricsManager:
         if self._metrics_cache is None:
             logger.info(f"Fetching data from URL: {self.data_url}")
             try:
-                self._metrics_cache = requests.get(self.data_url).json()
+                response = requests.get(self.data_url, timeout=5)
+                response.raise_for_status()
+                self._metrics_cache = response.json()
             except Exception as e:
-                logger.error(f"Error fetching data: {e}")
-                self._metrics_cache = {}
+                logger.warning("Falling back to bundled model metrics after remote fetch failed: %s", e)
+                try:
+                    with LOCAL_MODEL_DATA_PATH.open(encoding="utf-8") as handle:
+                        self._metrics_cache = json.load(handle)
+                except Exception as local_error:
+                    logger.error("Error loading bundled model metrics: %s", local_error)
+                    self._metrics_cache = {}
 
     def get_model_metrics(self, model_name) -> dict[str, Any]:
         self._load_data()

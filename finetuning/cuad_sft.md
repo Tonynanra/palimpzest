@@ -117,7 +117,9 @@ training:
   flash_attention: true
 ```
 
-The validated single-L40S smoke path used `qlora: true`, FlashAttention2, and `CUDA_VISIBLE_DEVICES=0`. BF16 LoRA is still supported, but QLoRA is the safer memory setting for long CUAD rows.
+The training artifact directory is owned by `train_cuad_sft.py`, not this YAML file. It defaults to `finetuning/artifacts/cuad-sft-run` and can be changed with `--output-dir`.
+
+The GH200 workflow uses `qlora: false`, FlashAttention2, and one visible CUDA device. The base model is loaded in BF16 and only the LoRA adapter parameters are trainable.
 
 The trainer:
 
@@ -137,13 +139,26 @@ The trainer:
   --config finetuning/sft_config.yaml
 ```
 
+For a one-step smoke run on the same training path:
+
+```bash
+./.venv/bin/python finetuning/train_cuad_sft.py \
+  --config finetuning/sft_config.yaml \
+  --max-steps 1 \
+  --eval-limit 1 \
+  --output-dir /tmp/cuad-sft-smoke
+```
+
 | Option | Default | Meaning |
 |---|---|---|
 | `--config` | `finetuning/sft_config.yaml` | YAML training configuration. |
 | `--resume-from-checkpoint` | unset | Hugging Face Trainer checkpoint to resume. |
+| `--max-steps` | unset | Optional optimizer-step cap for a smoke run. |
+| `--eval-limit` | unset | Optional limit on dev rows evaluated during training. |
+| `--output-dir` | `finetuning/artifacts/cuad-sft-run` | Training artifact directory; owned by the CLI/script rather than YAML. |
 | `--log-level` | `INFO` | Python logging level. |
 
-The trainer writes checkpoints, `adapter/`, tokenizer files, and `training_manifest.json` under the configured output directory.
+The trainer writes checkpoints, `adapter/`, tokenizer files, and `training_manifest.json` under the selected output directory.
 It also writes `training_walltime.jsonl` with `train_start`, `checkpoint`, and `train_end` events.
 Each checkpoint event records the checkpoint path, global step, epoch, UTC timestamp, and elapsed training seconds.
 
@@ -275,20 +290,25 @@ The project defines these optional extras in [pyproject.toml](../pyproject.toml)
 ./.venv/bin/pip install -e ".[sft,sft-serving,sft-kernels]"
 ```
 
-Qwen3.5 may require a newer Transformers source checkout than the normal package constraint. The validated smoke environment used a current Transformers development build, FlashAttention2, and `flash-linear-attention`. `causal-conv1d` may require `nvcc` to build; if unavailable, Transformers uses its reference implementation, which is slower but does not prevent the tested 32k QLoRA step from running.
+Qwen3.5 may require a newer Transformers source checkout than the normal package constraint. The validated smoke environment used a current Transformers development build, FlashAttention2, and `flash-linear-attention`. `causal-conv1d` may require `nvcc` to build; if unavailable, Transformers uses its reference implementation, which is slower but does not prevent the tested 32k BF16 LoRA step from running.
 
 ## Slurm job
 
 [run_cuad_sft.slurm](run_cuad_sft.slurm) runs the complete workflow on one node:
 
-- Partition: `pi_srmadden`
-- CPUs: 16
-- RAM: 32 GB
+- Account: `quanta`
+- Partition: `quanta-gh200`
+- QoS: `quanta-main`
+- Node constraint: `nvidia_gh200_480gb`
+- CPUs: 36
+- RAM: 240 GB
 - GPUs: 1
 - Time limit: 24 hours
 - Environment: repository `.venv`
-- Training: QLoRA, 3 epochs, 32k-token ceiling
+- Training: full BF16 LoRA, 3 epochs, 32k-token ceiling
 - Evaluation: all-field vanilla-vs-SFT comparison with fixed `sft_plots/`
+
+The job requires the existing local inputs `testdata/cuad-data` and `testdata/cuad-chunk`; it does not download data on the compute node. The SFT JSONL files are rebuilt into the job-specific artifact directory before training.
 
 Submit it from the repository root:
 

@@ -468,6 +468,13 @@ def _load_rows(data_dir: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be positive")
+    return parsed
+
+
 def _run_comparison(
     model_id: str,
     checkpoint: Path,
@@ -499,10 +506,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-dir", type=Path, required=True)
     parser.add_argument("--model-id", default="Qwen/Qwen3.5-4B")
     parser.add_argument("--mode", choices=["all", "singleton", "grouped", "randomized", "canonical"], default="all")
-    parser.add_argument("--max-new-tokens", type=int, default=8192)
-    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--max-new-tokens", type=_positive_int, default=8192)
+    parser.add_argument("--limit", type=_positive_int, default=None)
     parser.add_argument("--output", type=Path, default=None)
-    parser.add_argument("--timing-log-every", type=int, default=10)
+    parser.add_argument("--timing-log-every", type=_positive_int, default=10)
     parser.add_argument("--no-flash-attention", action="store_true")
     return parser
 
@@ -515,8 +522,6 @@ def main() -> None:
     args = parse_args()
     selected_rows = _prepare_rows(_load_rows(args.data_dir), args.mode, args.limit)
     output_path = args.output or (args.checkpoint.parent / "comparison.json")
-    if args.timing_log_every <= 0:
-        raise ValueError("--timing-log-every must be positive")
     timing_log_path = output_path.parent / "inference_walltime.jsonl"
     timing_logger = InferenceWalltimeLogger(timing_log_path)
     try:
