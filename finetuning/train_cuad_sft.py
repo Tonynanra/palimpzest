@@ -8,7 +8,7 @@ import json
 import logging
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -18,6 +18,7 @@ import yaml
 LOGGER = logging.getLogger("cuad-sft")
 DEFAULT_MODEL_ID = "Qwen/Qwen3.5-4B"
 DEFAULT_MAX_SEQ_LENGTH = 32768
+DEFAULT_OUTPUT_DIR = Path("finetuning/artifacts/cuad-sft-run")
 
 # Qwen3.5 dense text layers contain both the Qwen attention projections and
 # Gated DeltaNet projections.  Resolve only suffixes that are actually present
@@ -42,7 +43,7 @@ TARGET_MODULE_SUFFIXES = (
 class TrainConfig:
     model_id: str = DEFAULT_MODEL_ID
     data_dir: Path = Path("finetuning/artifacts/cuad-sft")
-    output_dir: Path = Path("finetuning/artifacts/cuad-sft-run")
+    output_dir: Path = DEFAULT_OUTPUT_DIR
     max_seq_length: int = DEFAULT_MAX_SEQ_LENGTH
     per_device_train_batch_size: int = 1
     per_device_eval_batch_size: int = 1
@@ -66,11 +67,9 @@ class TrainConfig:
         model = mapping.get("model", {})
         data = mapping.get("data", {})
         training = mapping.get("training", {})
-        output = mapping.get("output", {})
         values = {
             "model_id": model.get("id", mapping.get("model_id", cls.model_id)),
             "data_dir": Path(data.get("dir", mapping.get("data_dir", cls.data_dir))),
-            "output_dir": Path(output.get("dir", mapping.get("output_dir", cls.output_dir))),
             "max_seq_length": int(training.get("max_seq_length", cls.max_seq_length)),
             "per_device_train_batch_size": int(training.get("per_device_train_batch_size", cls.per_device_train_batch_size)),
             "per_device_eval_batch_size": int(training.get("per_device_eval_batch_size", cls.per_device_eval_batch_size)),
@@ -109,10 +108,14 @@ class TrainConfig:
 
 
 class CuadJsonlDataset:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, limit: int | None = None):
         self.path = path
         with path.open(encoding="utf-8") as handle:
             self.rows = [json.loads(line) for line in handle if line.strip()]
+        if limit is not None:
+            if limit <= 0:
+                raise ValueError("dataset limit must be positive")
+            self.rows = self.rows[:limit]
         if not self.rows:
             raise ValueError(f"No SFT examples found in {path}")
 
@@ -256,6 +259,12 @@ class WalltimeLoggingCallback:
         self.started_at = None
         self.started_perf = None
 
+    def __getattr__(self, name: str) -> Any:
+        """Remain compatible with new optional TrainerCallback lifecycle hooks."""
+        if name.startswith("on_"):
+            return lambda args, state, control, **kwargs: control
+        raise AttributeError(name)
+
     def _write(self, event: str, state: Any, **fields: Any) -> None:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         record = {
@@ -382,13 +391,23 @@ def _load_model_and_tokenizer(config: TrainConfig) -> tuple[Any, Any, list[str]]
     return model, tokenizer, targets
 
 
-def train(config: TrainConfig, resume_from_checkpoint: str | None = None) -> Path:
+def train(
+    config: TrainConfig,
+    resume_from_checkpoint: str | None = None,
+    *,
+    max_steps: int | None = None,
+    eval_limit: int | None = None,
+) -> Path:
     from transformers import TrainingArguments, set_seed
 
     config.validate()
+    if max_steps is not None and max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if eval_limit is not None and eval_limit <= 0:
+        raise ValueError("eval_limit must be positive")
     set_seed(config.seed)
     train_dataset = CuadJsonlDataset(config.data_dir / "train.jsonl")
-    eval_dataset = CuadJsonlDataset(config.data_dir / "dev.jsonl")
+    eval_dataset = CuadJsonlDataset(config.data_dir / "dev.jsonl", limit=eval_limit)
     model, tokenizer, targets = _load_model_and_tokenizer(config)
     collator = CuadDataCollator(tokenizer, config.max_seq_length)
     steps_per_epoch = max(
@@ -398,7 +417,7 @@ def train(config: TrainConfig, resume_from_checkpoint: str | None = None) -> Pat
             / (config.per_device_train_batch_size * config.gradient_accumulation_steps)
         ),
     )
-    total_steps = max(1, math.ceil(config.num_train_epochs * steps_per_epoch))
+    total_steps = max_steps or max(1, math.ceil(config.num_train_epochs * steps_per_epoch))
     warmup_steps = int(round(config.warmup_ratio * total_steps))
 
     config.output_dir.mkdir(parents=True, exist_ok=True)
@@ -408,6 +427,7 @@ def train(config: TrainConfig, resume_from_checkpoint: str | None = None) -> Pat
         per_device_eval_batch_size=config.per_device_eval_batch_size,
         gradient_accumulation_steps=config.gradient_accumulation_steps,
         num_train_epochs=config.num_train_epochs,
+        max_steps=max_steps if max_steps is not None else -1,
         learning_rate=config.learning_rate,
         warmup_steps=warmup_steps,
         weight_decay=config.weight_decay,
@@ -454,6 +474,10 @@ def train(config: TrainConfig, resume_from_checkpoint: str | None = None) -> Pat
                 },
                 "train_examples": len(train_dataset),
                 "dev_examples": len(eval_dataset),
+                "runtime_overrides": {
+                    "max_steps": max_steps,
+                    "eval_limit": eval_limit,
+                },
                 "train_metrics": train_output.metrics,
                 "walltime_log": str(config.output_dir / "training_walltime.jsonl"),
             },
@@ -464,19 +488,50 @@ def train(config: TrainConfig, resume_from_checkpoint: str | None = None) -> Pat
     return adapter_dir
 
 
-def parse_args() -> argparse.Namespace:
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be positive")
+    return parsed
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a Qwen3.5 CUAD LoRA adapter")
     parser.add_argument("--config", type=Path, default=Path("finetuning/sft_config.yaml"))
     parser.add_argument("--resume-from-checkpoint", default=None)
+    parser.add_argument(
+        "--max-steps",
+        type=_positive_int,
+        default=None,
+        help="Optional optimizer-step cap for a short smoke run.",
+    )
+    parser.add_argument(
+        "--eval-limit",
+        type=_positive_int,
+        default=None,
+        help="Optional limit on dev rows evaluated during training.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=DEFAULT_OUTPUT_DIR,
+        help=f"Training artifact directory (default: {DEFAULT_OUTPUT_DIR}).",
+    )
     parser.add_argument("--log-level", default="INFO")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main() -> None:
     args = parse_args()
     logging.basicConfig(level=getattr(logging, args.log_level.upper()))
     config = _load_config(args.config)
-    adapter_dir = train(config, resume_from_checkpoint=args.resume_from_checkpoint)
+    config = replace(config, output_dir=args.output_dir)
+    adapter_dir = train(
+        config,
+        resume_from_checkpoint=args.resume_from_checkpoint,
+        max_steps=args.max_steps,
+        eval_limit=args.eval_limit,
+    )
     LOGGER.info("Saved adapter to %s", adapter_dir)
 
 

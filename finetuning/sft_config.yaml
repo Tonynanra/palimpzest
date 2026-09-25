@@ -1,4 +1,4 @@
-# Qwen3.5-4B CUAD LoRA SFT configuration for one NVIDIA L40S.
+# Qwen3.5-4B CUAD full-BF16 LoRA SFT configuration for one NVIDIA GH200.
 # Build data first:
 #   python finetuning/cuad_sft_data.py
 # Train:
@@ -10,11 +10,8 @@ model:
 data:
   dir: finetuning/artifacts/cuad-sft
 
-output:
-  dir: finetuning/artifacts/cuad-sft-run
-
 training:
-  max_seq_length: 32768
+  max_seq_length: 36864
   per_device_train_batch_size: 1
   per_device_eval_batch_size: 1
   gradient_accumulation_steps: 4

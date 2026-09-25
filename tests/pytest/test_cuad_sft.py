@@ -13,7 +13,8 @@ if str(FINETUNING_DIR) not in sys.path:
 
 import cuad_sft_data  # noqa: E402
 import evaluate_cuad_sft  # noqa: E402
-from train_cuad_sft import WalltimeLoggingCallback, _tokenize_pair  # noqa: E402
+import train_cuad_sft  # noqa: E402
+from train_cuad_sft import DEFAULT_OUTPUT_DIR, TrainConfig, WalltimeLoggingCallback, _tokenize_pair  # noqa: E402
 
 
 def test_json_target_preserves_requested_field_order():
@@ -125,6 +126,82 @@ def test_evaluator_cli_has_no_comparison_or_plot_directory_flags():
 
     assert "--compare-baseline" not in option_strings
     assert "--plot-dir" not in option_strings
+
+
+def test_training_cli_smoke_controls_and_output_default():
+    args = train_cuad_sft.parse_args(["--max-steps", "1", "--eval-limit", "1"])
+
+    assert args.max_steps == 1
+    assert args.eval_limit == 1
+    assert args.output_dir == DEFAULT_OUTPUT_DIR
+
+    explicit = train_cuad_sft.parse_args(["--output-dir", "/tmp/cuad-smoke"])
+    assert explicit.output_dir == Path("/tmp/cuad-smoke")
+
+    config = TrainConfig.from_mapping({})
+    assert config.output_dir == DEFAULT_OUTPUT_DIR
+
+
+def test_sft_yaml_does_not_define_output_directory():
+    config_text = (FINETUNING_DIR / "sft_config.yaml").read_text(encoding="utf-8")
+    assert "output:" not in config_text
+    assert "cuad-sft-run" not in config_text
+
+
+def test_evaluator_cli_rejects_non_positive_smoke_values():
+    parser = evaluate_cuad_sft.build_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--checkpoint", "checkpoint", "--data-dir", "data", "--limit", "0"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--checkpoint", "checkpoint", "--data-dir", "data", "--max-new-tokens", "0"])
+
+
+def test_training_passes_smoke_limits_to_trainer(monkeypatch, tmp_path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    rows = '{"id":"row"}\n'
+    (data_dir / "train.jsonl").write_text(rows * 2, encoding="utf-8")
+    (data_dir / "dev.jsonl").write_text(rows * 3, encoding="utf-8")
+
+    captured = {}
+
+    class FakeTrainingArguments:
+        def __init__(self, **kwargs):
+            captured["training_args"] = kwargs
+
+    class FakeTokenizer:
+        def save_pretrained(self, path):
+            Path(path).mkdir(parents=True, exist_ok=True)
+
+    class FakeTrainer:
+        def __init__(self, **kwargs):
+            captured["trainer"] = kwargs
+
+        def train(self, resume_from_checkpoint=None):
+            captured["resume_from_checkpoint"] = resume_from_checkpoint
+            return SimpleNamespace(metrics={})
+
+        def save_model(self, path):
+            Path(path).mkdir(parents=True, exist_ok=True)
+
+    import transformers
+
+    monkeypatch.setattr(transformers, "TrainingArguments", FakeTrainingArguments)
+    monkeypatch.setattr(transformers, "set_seed", lambda seed: None)
+    monkeypatch.setattr(
+        train_cuad_sft,
+        "_load_model_and_tokenizer",
+        lambda config: (object(), FakeTokenizer(), ["q_proj"]),
+    )
+    monkeypatch.setattr(train_cuad_sft.CuadTrainer, "build_base", staticmethod(lambda: FakeTrainer))
+
+    config = TrainConfig(data_dir=data_dir, output_dir=tmp_path / "output")
+    train_cuad_sft.train(config, max_steps=1, eval_limit=1)
+
+    assert captured["training_args"]["max_steps"] == 1
+    assert len(captured["trainer"]["train_dataset"]) == 2
+    assert len(captured["trainer"]["eval_dataset"]) == 1
 
 
 def test_metric_delta_is_sft_minus_vanilla():
