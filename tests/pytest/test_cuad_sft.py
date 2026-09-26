@@ -14,7 +14,14 @@ if str(FINETUNING_DIR) not in sys.path:
 import cuad_sft_data  # noqa: E402
 import evaluate_cuad_sft  # noqa: E402
 import train_cuad_sft  # noqa: E402
-from train_cuad_sft import DEFAULT_OUTPUT_DIR, TrainConfig, WalltimeLoggingCallback, _tokenize_pair  # noqa: E402
+from train_cuad_sft import (  # noqa: E402
+    DEFAULT_MAX_SEQ_LENGTH,
+    DEFAULT_MODEL_ID,
+    DEFAULT_OUTPUT_DIR,
+    TrainConfig,
+    WalltimeLoggingCallback,
+    _tokenize_pair,
+)
 
 
 def test_json_target_preserves_requested_field_order():
@@ -93,7 +100,7 @@ def test_token_mask_supervises_only_assistant_completion():
 def _sample_metrics(role: str) -> dict:
     return {
         "model_role": role,
-        "model_id": "Qwen/Qwen3.5-4B",
+        "model_id": DEFAULT_MODEL_ID,
         "precision": 0.5 if role == "vanilla" else 0.75,
         "recall": 0.4 if role == "vanilla" else 0.6,
         "f1": 0.444 if role == "vanilla" else 0.666,
@@ -139,6 +146,9 @@ def test_training_cli_smoke_controls_and_output_default():
     assert explicit.output_dir == Path("/tmp/cuad-smoke")
 
     config = TrainConfig.from_mapping({})
+    assert DEFAULT_MODEL_ID == "Qwen/Qwen3.8-27B-FP8"
+    assert config.max_seq_length == DEFAULT_MAX_SEQ_LENGTH == 36864
+    assert config.lora_dropout == 0.0
     assert config.output_dir == DEFAULT_OUTPUT_DIR
 
 
@@ -231,7 +241,7 @@ def test_adapter_comparison_evaluates_same_rows_in_both_modes(monkeypatch, tmp_p
     monkeypatch.setattr(evaluate_cuad_sft, "_evaluate_rows", fake_evaluate)
     rows = [{"id": "row-1"}]
     result = evaluate_cuad_sft._run_comparison(
-        "Qwen/Qwen3.5-4B",
+        DEFAULT_MODEL_ID,
         checkpoint,
         rows,
         "all",
@@ -256,7 +266,7 @@ def test_merged_comparison_releases_vanilla_before_sft(monkeypatch, tmp_path):
     )
 
     result = evaluate_cuad_sft._run_comparison(
-        "Qwen/Qwen3.5-4B",
+        DEFAULT_MODEL_ID,
         tmp_path / "merged",
         [{"id": "row-1"}],
         "all",
@@ -313,6 +323,41 @@ def test_training_walltime_callback_logs_checkpoints(tmp_path):
     assert events[1]["elapsed_seconds"] >= 0
 
 
+def test_training_estimate_excludes_triton_compile_step(monkeypatch, tmp_path):
+    snapshots = [
+        {},
+        {"kernel": (1, 1)},
+        {"kernel": (1, 1)},
+        {"kernel": (1, 1)},
+        {"kernel": (1, 1)},
+        {"kernel": (1, 1)},
+    ]
+    monkeypatch.setattr(
+        WalltimeLoggingCallback,
+        "_triton_cache_snapshot",
+        staticmethod(lambda: snapshots.pop(0)),
+    )
+    log_path = tmp_path / "training_walltime.jsonl"
+    callback = WalltimeLoggingCallback(log_path, full_run_steps=10)
+    args = SimpleNamespace(output_dir=str(tmp_path))
+    state = SimpleNamespace(global_step=0, epoch=0.0)
+    control = SimpleNamespace()
+
+    callback.on_train_begin(args, state, control)
+    for step in (1, 2, 3):
+        callback.on_step_begin(args, state, control)
+        state.global_step = step
+        callback.on_step_end(args, state, control)
+    callback.on_train_end(args, state, control)
+
+    assert callback.summary["triton_compile_optimizer_step_count"] == 1
+    assert callback.summary["triton_compile_optimizer_steps"] == [1]
+    assert callback.summary["steady_optimizer_step_count"] == 2
+    assert callback.summary["estimate_status"] == "clean_steady_state_with_compile_steps_excluded"
+    expected = callback.optimizer_step_seconds[0] + 9 * callback.summary["steady_optimizer_step_mean_seconds"]
+    assert callback.summary["estimated_full_training_loop_seconds"] == pytest.approx(expected)
+
+
 def test_inference_walltime_is_logged_periodically(monkeypatch, tmp_path):
     log_path = tmp_path / "inference_walltime.jsonl"
     logger = evaluate_cuad_sft.InferenceWalltimeLogger(log_path)
@@ -339,7 +384,7 @@ def test_inference_walltime_is_logged_periodically(monkeypatch, tmp_path):
             rows,
             8,
             "vanilla",
-            "Qwen/Qwen3.5-4B",
+            DEFAULT_MODEL_ID,
             mode="all",
             timing_logger=logger,
             timing_log_every=1,

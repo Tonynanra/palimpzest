@@ -1,4 +1,4 @@
-"""Single-GPU LoRA SFT trainer for Qwen3.5 on CUAD."""
+"""Single-GPU LoRA SFT trainer for Qwen3.8-27B-FP8 on CUAD."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import importlib.util
 import json
 import logging
 import math
+import os
 import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -16,11 +17,11 @@ from typing import Any
 import yaml
 
 LOGGER = logging.getLogger("cuad-sft")
-DEFAULT_MODEL_ID = "Qwen/Qwen3.5-4B"
-DEFAULT_MAX_SEQ_LENGTH = 32768
+DEFAULT_MODEL_ID = "Qwen/Qwen3.8-27B-FP8"
+DEFAULT_MAX_SEQ_LENGTH = 36864
 DEFAULT_OUTPUT_DIR = Path("finetuning/artifacts/cuad-sft-run")
 
-# Qwen3.5 dense text layers contain both the Qwen attention projections and
+# Qwen3.8's dense text backbone contains both the Qwen attention projections and
 # Gated DeltaNet projections.  Resolve only suffixes that are actually present
 # in the loaded text-only model and fail closed if none are found.
 TARGET_MODULE_SUFFIXES = (
@@ -54,7 +55,9 @@ class TrainConfig:
     weight_decay: float = 0.0
     lora_rank: int = 32
     lora_alpha: int = 64
-    lora_dropout: float = 0.05
+    # PyTorch does not implement dropout for the Float8 activations exposed by
+    # this fine-grained FP8 checkpoint's native PEFT path.
+    lora_dropout: float = 0.0
     seed: int = 42
     logging_steps: int = 1
     save_total_limit: int = 3
@@ -96,7 +99,7 @@ class TrainConfig:
         if self.max_seq_length <= 0:
             raise ValueError("max_seq_length must be positive")
         if self.per_device_train_batch_size != 1 or self.per_device_eval_batch_size != 1:
-            raise ValueError("The CUAD SFT implementation is configured for batch size 1 on one L40S")
+            raise ValueError("The CUAD SFT implementation is configured for batch size 1 on one GH200")
         if self.gradient_accumulation_steps <= 0:
             raise ValueError("gradient_accumulation_steps must be positive")
         if self.num_train_epochs <= 0 or self.learning_rate <= 0:
@@ -252,12 +255,30 @@ class CuadTrainer:
 
 
 class WalltimeLoggingCallback:
-    """Write durable walltime events at train start, checkpoints, and train end."""
+    """Write synchronized timing events and exclude Triton compilation from steady state."""
 
-    def __init__(self, log_path: Path):
+    def __init__(
+        self,
+        log_path: Path,
+        *,
+        full_run_steps: int | None = None,
+        train_examples: int | None = None,
+        gradient_accumulation_steps: int | None = None,
+    ):
         self.log_path = log_path
         self.started_at = None
         self.started_perf = None
+        self.full_run_steps = full_run_steps
+        self.train_examples = train_examples
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.step_started_perf = None
+        self.substep_started_perf = None
+        self.microbatch_index = 0
+        self.optimizer_step_seconds: list[float] = []
+        self.optimizer_step_records: list[dict[str, Any]] = []
+        self._triton_cache_before_step: dict[str, tuple[int, int]] | None = None
+        self._triton_cache_tracking_limit = 32
+        self.summary: dict[str, Any] = {}
 
     def __getattr__(self, name: str) -> Any:
         """Remain compatible with new optional TrainerCallback lifecycle hooks."""
@@ -276,15 +297,200 @@ class WalltimeLoggingCallback:
         with self.log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
+    @staticmethod
+    def _synchronize_cuda() -> None:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+    @staticmethod
+    def _cuda_memory() -> dict[str, int] | None:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        return {
+            "allocated_bytes": int(torch.cuda.memory_allocated()),
+            "reserved_bytes": int(torch.cuda.memory_reserved()),
+            "max_allocated_bytes": int(torch.cuda.max_memory_allocated()),
+        }
+
+    @staticmethod
+    def _compile_debug() -> dict[str, Any]:
+        try:
+            from torch._dynamo.utils import counters
+
+            return {
+                str(group): {str(key): int(value) for key, value in values.items() if value}
+                for group, values in counters.items()
+                if values
+            }
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _triton_cache_root() -> Path | None:
+        configured = os.environ.get("TRITON_CACHE_DIR")
+        root = Path(configured) if configured else Path.home() / ".triton" / "cache"
+        try:
+            if root.exists() or configured:
+                return root
+        except OSError:
+            return None
+        return None
+
+    @classmethod
+    def _triton_cache_snapshot(cls) -> dict[str, tuple[int, int]] | None:
+        """Return file size/mtime state for Triton's JIT cache, if trackable."""
+        root = cls._triton_cache_root()
+        if root is None:
+            return None
+        snapshot: dict[str, tuple[int, int]] = {}
+        try:
+            if not root.exists():
+                return snapshot
+            for path in root.rglob("*"):
+                if path.is_file():
+                    stat = path.stat()
+                    snapshot[str(path.relative_to(root))] = (stat.st_size, stat.st_mtime_ns)
+        except OSError:
+            return None
+        return snapshot
+
+    @staticmethod
+    def _triton_cache_diff(
+        before: dict[str, tuple[int, int]] | None,
+        after: dict[str, tuple[int, int]] | None,
+    ) -> dict[str, Any]:
+        if before is None or after is None:
+            return {
+                "triton_cache_tracking_available": False,
+                "includes_triton_kernel_compile": False,
+                "triton_cache_new_file_count": None,
+                "triton_cache_modified_file_count": None,
+            }
+        new_files = set(after) - set(before)
+        modified_files = {path for path in set(after) & set(before) if after[path] != before[path]}
+        return {
+            "triton_cache_tracking_available": True,
+            "includes_triton_kernel_compile": bool(new_files or modified_files),
+            "triton_cache_new_file_count": len(new_files),
+            "triton_cache_modified_file_count": len(modified_files),
+        }
+
+    def _process_elapsed(self) -> float | None:
+        return time.perf_counter() - self.started_perf if self.started_perf is not None else None
+
     def on_train_begin(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
-        del args, control, kwargs
+        model = kwargs.get("model")
+        del control
+        self._synchronize_cuda()
         self.started_at = datetime.now(timezone.utc).isoformat()
         self.started_perf = time.perf_counter()
-        self._write("train_start", state, started_at_utc=self.started_at)
+        fields: dict[str, Any] = {
+            "started_at_utc": self.started_at,
+            "planned_optimizer_steps": getattr(state, "max_steps", None),
+            "full_run_optimizer_steps": self.full_run_steps,
+            "train_examples": self.train_examples,
+            "gradient_accumulation_steps": self.gradient_accumulation_steps,
+            "model_class": type(model).__name__ if model is not None else None,
+            "model_is_quantized": bool(getattr(model, "is_quantized", False)) if model is not None else None,
+            "model_is_compiled": bool(hasattr(model, "_orig_mod")) if model is not None else None,
+            "cuda_memory": self._cuda_memory(),
+            "torch_compile_counters": self._compile_debug(),
+            "triton_cache_dir": str(self._triton_cache_root()) if self._triton_cache_root() else None,
+        }
+        self._write("train_start", state, **fields)
+        LOGGER.info(
+            "timing stage=train_loop_start planned_steps=%s full_run_steps=%s model=%s quantized=%s compiled=%s cuda_memory=%s",
+            fields["planned_optimizer_steps"],
+            self.full_run_steps,
+            fields["model_class"],
+            fields["model_is_quantized"],
+            fields["model_is_compiled"],
+            fields["cuda_memory"],
+        )
+
+    def on_substep_begin(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
+        del args, state, control, kwargs
+        self._synchronize_cuda()
+        self.substep_started_perf = time.perf_counter()
+        self.microbatch_index += 1
+
+    def on_substep_end(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
+        del args, control, kwargs
+        if self.substep_started_perf is None:
+            return
+        self._synchronize_cuda()
+        elapsed = time.perf_counter() - self.substep_started_perf
+        self.substep_started_perf = None
+        if self.microbatch_index <= 8:
+            self._write(
+                "microbatch",
+                state,
+                microbatch_index=self.microbatch_index,
+                microbatch_seconds=elapsed,
+                process_elapsed_seconds=self._process_elapsed(),
+                includes_first_step_overhead=self.microbatch_index <= 4,
+            )
+
+    def on_step_begin(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
+        del args, state, control, kwargs
+        self._synchronize_cuda()
+        if len(self.optimizer_step_records) < self._triton_cache_tracking_limit:
+            self._triton_cache_before_step = self._triton_cache_snapshot()
+        else:
+            self._triton_cache_before_step = None
+        self.step_started_perf = time.perf_counter()
+
+    def on_step_end(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
+        del args, control, kwargs
+        if self.step_started_perf is None:
+            return
+        self._synchronize_cuda()
+        elapsed = time.perf_counter() - self.step_started_perf
+        self.step_started_perf = None
+        triton_cache = self._triton_cache_diff(
+            self._triton_cache_before_step,
+            self._triton_cache_snapshot() if self._triton_cache_before_step is not None else None,
+        )
+        self._triton_cache_before_step = None
+        self.optimizer_step_seconds.append(elapsed)
+        global_step = int(getattr(state, "global_step", 0))
+        is_first_step = global_step == 1
+        self.optimizer_step_records.append(
+            {
+                "global_step": global_step,
+                "optimizer_step_seconds": elapsed,
+                **triton_cache,
+            }
+        )
+        self._write(
+            "optimizer_step",
+            state,
+            optimizer_step_seconds=elapsed,
+            process_elapsed_seconds=self._process_elapsed(),
+            includes_first_step_overhead=is_first_step,
+            cuda_memory=self._cuda_memory(),
+            **triton_cache,
+        )
+        if is_first_step or global_step <= 3 or global_step % 100 == 0:
+            LOGGER.info(
+                "timing optimizer_step=%s seconds=%.3f first_step_overhead=%s triton_compile=%s cache_new=%s cache_modified=%s cuda_memory=%s",
+                global_step,
+                elapsed,
+                is_first_step,
+                triton_cache["includes_triton_kernel_compile"],
+                triton_cache["triton_cache_new_file_count"],
+                triton_cache["triton_cache_modified_file_count"],
+                self._cuda_memory(),
+            )
 
     def on_save(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
         del control, kwargs
-        elapsed = time.perf_counter() - self.started_perf if self.started_perf is not None else None
+        self._synchronize_cuda()
+        elapsed = self._process_elapsed()
         checkpoint = Path(args.output_dir) / f"checkpoint-{state.global_step}"
         self._write(
             "checkpoint",
@@ -296,12 +502,71 @@ class WalltimeLoggingCallback:
 
     def on_train_end(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
         del args, control, kwargs
-        elapsed = time.perf_counter() - self.started_perf if self.started_perf is not None else None
-        self._write("train_end", state, elapsed_seconds=elapsed)
+        self._synchronize_cuda()
+        elapsed = self._process_elapsed()
+        records = self.optimizer_step_records
+        first_step = records[0]["optimizer_step_seconds"] if records else None
+        compile_records = [record for record in records if record["includes_triton_kernel_compile"]]
+        warmup_records = [
+            record
+            for index, record in enumerate(records)
+            if index == 0 or record["includes_triton_kernel_compile"]
+        ]
+        steady_records = [
+            record
+            for index, record in enumerate(records)
+            if index > 0
+            and record["triton_cache_tracking_available"]
+            and not record["includes_triton_kernel_compile"]
+        ]
+        steady_steps = [record["optimizer_step_seconds"] for record in steady_records]
+        steady_mean = sum(steady_steps) / len(steady_steps) if steady_steps else None
+        estimated_full = None
+        estimate_status = "insufficient_clean_steady_state_samples"
+        tracking_available = bool(records) and all(
+            record["triton_cache_tracking_available"] for record in records
+        )
+        if steady_mean is not None and self.full_run_steps is not None and tracking_available:
+            one_time_seconds = sum(record["optimizer_step_seconds"] for record in warmup_records)
+            remaining_steps = max(self.full_run_steps - len(warmup_records), 0)
+            estimated_full = one_time_seconds + remaining_steps * steady_mean
+            estimate_status = "clean_steady_state_with_compile_steps_excluded"
+        self.summary = {
+            "train_loop_walltime_seconds": elapsed,
+            "observed_optimizer_steps": len(records),
+            "first_optimizer_step_seconds": first_step,
+            "steady_optimizer_step_count": len(steady_steps),
+            "steady_optimizer_step_mean_seconds": steady_mean,
+            "triton_compile_optimizer_step_count": len(compile_records),
+            "triton_compile_optimizer_steps": [record["global_step"] for record in compile_records],
+            "triton_compile_step_seconds": sum(
+                record["optimizer_step_seconds"] for record in compile_records
+            ),
+            "warmup_optimizer_step_count": len(warmup_records),
+            "warmup_optimizer_step_seconds": sum(
+                record["optimizer_step_seconds"] for record in warmup_records
+            ),
+            "triton_cache_tracking_available": tracking_available,
+            "full_run_optimizer_steps": self.full_run_steps,
+            "estimated_full_training_loop_seconds": estimated_full,
+            "estimate_status": estimate_status,
+            "estimate_method": (
+                "one-time first/compile steps plus clean steady-state mean; "
+                "Triton compile steps are never multiplied"
+            ),
+            "torch_compile_counters": self._compile_debug(),
+        }
+        self._write(
+            "train_end",
+            state,
+            **self.summary,
+            cuda_memory=self._cuda_memory(),
+        )
+        LOGGER.info("timing summary %s", self.summary)
 
 
 def resolve_lora_targets(model: Any) -> list[str]:
-    """Return the supported Qwen3.5 text projection suffixes present in `model`."""
+    """Return supported Qwen3.8 text projection suffixes present in `model`."""
     import torch
 
     linear_suffixes = {
@@ -312,7 +577,7 @@ def resolve_lora_targets(model: Any) -> list[str]:
     targets = [suffix for suffix in TARGET_MODULE_SUFFIXES if suffix in linear_suffixes]
     if not targets:
         raise RuntimeError(
-            "No Qwen3.5 LoRA target modules were found. "
+            "No Qwen3.8 LoRA target modules were found. "
             f"Observed linear suffixes: {sorted(linear_suffixes)}"
         )
     forbidden = {
@@ -332,22 +597,45 @@ def _load_config(path: Path) -> TrainConfig:
         return TrainConfig.from_mapping(yaml.safe_load(handle) or {})
 
 
+def _log_trainable_parameters(model: Any) -> None:
+    if hasattr(model, "print_trainable_parameters"):
+        model.print_trainable_parameters()
+        return
+    trainable = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+    total = sum(parameter.numel() for parameter in model.parameters())
+    percentage = 100.0 * trainable / total if total else 0.0
+    LOGGER.info(
+        "trainable params: %s || all params: %s || trainable%%: %.4f",
+        trainable,
+        total,
+        percentage,
+    )
+
+
 def _load_model_and_tokenizer(config: TrainConfig) -> tuple[Any, Any, list[str]]:
     import torch
-    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+    from peft import LoraConfig, prepare_model_for_kbit_training
     from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+    from transformers.utils.quantization_config import FineGrainedFP8Config
 
     if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required for Qwen3.5 CUAD SFT")
+        raise RuntimeError("CUDA is required for Qwen3.8 CUAD SFT")
     if torch.cuda.device_count() != 1:
         raise RuntimeError(
             f"This entrypoint is single-GPU by design; detected {torch.cuda.device_count()} GPUs"
         )
 
+    load_started = time.perf_counter()
     tokenizer = AutoTokenizer.from_pretrained(config.model_id, use_fast=True)
     tokenizer.padding_side = "right"
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
+    LOGGER.info(
+        "timing stage=tokenizer_load seconds=%.3f model_id=%s vocab_size=%s",
+        time.perf_counter() - load_started,
+        config.model_id,
+        getattr(tokenizer, "vocab_size", None),
+    )
 
     model_kwargs: dict[str, Any] = {
         "torch_dtype": torch.bfloat16,
@@ -364,8 +652,28 @@ def _load_model_and_tokenizer(config: TrainConfig) -> tuple[Any, Any, list[str]]
             bnb_4bit_compute_dtype=torch.bfloat16,
             bnb_4bit_use_double_quant=True,
         )
+    elif config.model_id.lower().endswith("-fp8"):
+        # Transformers' compressed FP8 kernels are inference-only: the
+        # fine-grained matmul has no autograd formula.  GH200 has ample memory
+        # to dequantize this 27B checkpoint to BF16 before attaching LoRA,
+        # preserving the requested base model while making SFT trainable.
+        model_kwargs["quantization_config"] = FineGrainedFP8Config(dequantize=True)
+        LOGGER.info("Qwen3.8 FP8 checkpoint will be dequantized to BF16 for LoRA training")
 
+    model_load_started = time.perf_counter()
+    # AutoModelForCausalLM unwraps Qwen3.8's composite vision-language config
+    # into its text-only Qwen3_5ForCausalLM backbone for this text dataset.
     model = AutoModelForCausalLM.from_pretrained(config.model_id, **model_kwargs)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    LOGGER.info(
+        "timing stage=model_load seconds=%.3f model_class=%s quantized=%s dequantized_for_training=%s hf_quantizer=%s",
+        time.perf_counter() - model_load_started,
+        type(model).__name__,
+        bool(getattr(model, "is_quantized", False)),
+        bool(config.model_id.lower().endswith("-fp8") and not getattr(model, "is_quantized", False)),
+        type(getattr(model, "hf_quantizer", None)).__name__ if getattr(model, "hf_quantizer", None) else None,
+    )
     if config.qlora:
         model = prepare_model_for_kbit_training(
             model,
@@ -386,8 +694,31 @@ def _load_model_and_tokenizer(config: TrainConfig) -> tuple[Any, Any, list[str]]
         bias="none",
         task_type="CAUSAL_LM",
     )
-    model = get_peft_model(model, lora_config)
-    model.print_trainable_parameters()
+    adapter_started = time.perf_counter()
+    if hasattr(model, "add_adapter"):
+        # Transformers' native PEFT integration marks the base model as
+        # adapter-enabled.  That is required for FP8 checkpoints because the
+        # generic get_peft_model wrapper is rejected by the FP8 training guard.
+        model.add_adapter(lora_config, adapter_name="default")
+        model.set_adapter("default")
+    else:
+        if getattr(model, "is_quantized", False):
+            raise RuntimeError(
+                "The installed Transformers version cannot attach a native LoRA adapter to this FP8 checkpoint; "
+                "install Transformers >= 5.8 and PEFT >= 0.20."
+            )
+        from peft import get_peft_model
+
+        model = get_peft_model(model, lora_config)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    LOGGER.info(
+        "timing stage=lora_attach seconds=%.3f adapter_api=%s target_modules=%s",
+        time.perf_counter() - adapter_started,
+        "transformers_native" if hasattr(model, "_hf_peft_config_loaded") else "peft_wrapper",
+        targets,
+    )
+    _log_trainable_parameters(model)
     return model, tokenizer, targets
 
 
@@ -405,10 +736,26 @@ def train(
         raise ValueError("max_steps must be positive")
     if eval_limit is not None and eval_limit <= 0:
         raise ValueError("eval_limit must be positive")
+    run_started = time.perf_counter()
     set_seed(config.seed)
+    dataset_started = time.perf_counter()
     train_dataset = CuadJsonlDataset(config.data_dir / "train.jsonl")
     eval_dataset = CuadJsonlDataset(config.data_dir / "dev.jsonl", limit=eval_limit)
+    LOGGER.info(
+        "timing stage=dataset_load seconds=%.3f train_examples=%s dev_examples=%s eval_limit=%s data_dir=%s",
+        time.perf_counter() - dataset_started,
+        len(train_dataset),
+        len(eval_dataset),
+        eval_limit,
+        config.data_dir,
+    )
+    model_started = time.perf_counter()
     model, tokenizer, targets = _load_model_and_tokenizer(config)
+    LOGGER.info(
+        "timing stage=model_and_adapter_ready seconds=%.3f process_seconds=%.3f",
+        time.perf_counter() - model_started,
+        time.perf_counter() - run_started,
+    )
     collator = CuadDataCollator(tokenizer, config.max_seq_length)
     steps_per_epoch = max(
         1,
@@ -417,10 +764,18 @@ def train(
             / (config.per_device_train_batch_size * config.gradient_accumulation_steps)
         ),
     )
-    total_steps = max_steps or max(1, math.ceil(config.num_train_epochs * steps_per_epoch))
+    full_run_steps = max(1, math.ceil(config.num_train_epochs * steps_per_epoch))
+    total_steps = max_steps or full_run_steps
     warmup_steps = int(round(config.warmup_ratio * total_steps))
 
     config.output_dir.mkdir(parents=True, exist_ok=True)
+    trainer_started = time.perf_counter()
+    timing_callback = WalltimeLoggingCallback(
+        config.output_dir / "training_walltime.jsonl",
+        full_run_steps=full_run_steps,
+        train_examples=len(train_dataset),
+        gradient_accumulation_steps=config.gradient_accumulation_steps,
+    )
     training_args = TrainingArguments(
         output_dir=str(config.output_dir),
         per_device_train_batch_size=config.per_device_train_batch_size,
@@ -456,7 +811,14 @@ def train(
         eval_dataset=eval_dataset,
         data_collator=collator,
         processing_class=tokenizer,
-        callbacks=[WalltimeLoggingCallback(config.output_dir / "training_walltime.jsonl")],
+        callbacks=[timing_callback],
+    )
+    LOGGER.info(
+        "timing stage=trainer_init seconds=%.3f steps_per_epoch=%s smoke_steps=%s full_run_steps=%s",
+        time.perf_counter() - trainer_started,
+        steps_per_epoch,
+        max_steps,
+        full_run_steps,
     )
     train_output = trainer.train(resume_from_checkpoint=resume_from_checkpoint)
     adapter_dir = config.output_dir / "adapter"
@@ -474,11 +836,14 @@ def train(
                 },
                 "train_examples": len(train_dataset),
                 "dev_examples": len(eval_dataset),
+                "steps_per_epoch": steps_per_epoch,
+                "full_run_optimizer_steps": full_run_steps,
                 "runtime_overrides": {
                     "max_steps": max_steps,
                     "eval_limit": eval_limit,
                 },
                 "train_metrics": train_output.metrics,
+                "timing_summary": timing_callback.summary,
                 "walltime_log": str(config.output_dir / "training_walltime.jsonl"),
             },
             handle,
@@ -496,7 +861,7 @@ def _positive_int(value: str) -> int:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train a Qwen3.5 CUAD LoRA adapter")
+    parser = argparse.ArgumentParser(description="Train a Qwen3.8-27B-FP8 CUAD LoRA adapter")
     parser.add_argument("--config", type=Path, default=Path("finetuning/sft_config.yaml"))
     parser.add_argument("--resume-from-checkpoint", default=None)
     parser.add_argument(

@@ -1,11 +1,11 @@
-# Qwen3.5-4B CUAD full-BF16 LoRA SFT configuration for one NVIDIA GH200.
+# Qwen3.8-27B-FP8 CUAD BF16 LoRA SFT configuration for one NVIDIA GH200.
 # Build data first:
 #   python finetuning/cuad_sft_data.py
 # Train:
 #   python finetuning/train_cuad_sft.py --config finetuning/sft_config.yaml
 
 model:
-  id: Qwen/Qwen3.5-4B
+  id: Qwen/Qwen3.8-27B-FP8
 
 data:
   dir: finetuning/artifacts/cuad-sft
@@ -21,7 +21,8 @@ training:
   weight_decay: 0.0
   lora_rank: 32
   lora_alpha: 64
-  lora_dropout: 0.05
+  # Float8 activations do not support PyTorch dropout in native PEFT.
+  lora_dropout: 0.0
   seed: 42
   logging_steps: 1
   save_total_limit: 3

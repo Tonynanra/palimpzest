@@ -53,19 +53,18 @@ classifiers=[
 
 [project.optional-dependencies]
 vllm = [
-    # Keep vLLM on the wheel-supported, Transformers 4-compatible stack used
-    # by sentence-transformers==5.0.0.  Newer releases require Transformers
-    # 5.x, while unconstrained resolution can fall back to a CUDA source
-    # build on the repository's glibc 2.28 hosts.
+    # Keep the serving extra pinned independently; the Qwen3.8 SFT path uses
+    # the Transformers 5.x stack declared below.
     "vllm==0.23.0",
 ]
 sft = [
     "accelerate>=1.10.0",
     "bitsandbytes>=0.46.0",
-    "peft>=0.17.0",
+    "kernels>=0.17.0,<0.18.0",
+    "peft>=0.20.0",
     "safetensors>=0.5.3",
     "torch>=2.7.0",
-    "transformers>=4.57.0,<5.0.0",
+    "transformers>=5.8.0",
 ]
 sft-serving = [
     "vllm==0.23.0",

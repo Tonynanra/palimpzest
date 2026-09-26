@@ -1,10 +1,15 @@
-"""Launch a Qwen3.5 CUAD adapter through an OpenAI-compatible vLLM server."""
+"""Launch a Qwen3.8-27B-FP8 CUAD adapter through vLLM."""
 
 from __future__ import annotations
 
 import argparse
 import subprocess
 from pathlib import Path
+
+try:
+    from .train_cuad_sft import DEFAULT_MAX_SEQ_LENGTH, DEFAULT_MODEL_ID
+except ImportError:
+    from train_cuad_sft import DEFAULT_MAX_SEQ_LENGTH, DEFAULT_MODEL_ID
 
 
 def build_command(args: argparse.Namespace) -> list[str]:
@@ -19,7 +24,7 @@ def build_command(args: argparse.Namespace) -> list[str]:
         "--port",
         str(args.port),
         "--dtype",
-        "bfloat16",
+        "auto",
         "--max-model-len",
         str(args.max_model_len),
         "--language-model-only",
@@ -40,15 +45,15 @@ def build_command(args: argparse.Namespace) -> list[str]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Serve a CUAD Qwen3.5 adapter with vLLM")
-    parser.add_argument("--model-id", default="Qwen/Qwen3.5-4B")
+    parser = argparse.ArgumentParser(description="Serve a CUAD Qwen3.8-27B-FP8 adapter with vLLM")
+    parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
     parser.add_argument("--adapter-dir", type=Path, default=None)
     parser.add_argument("--merged-dir", type=Path, default=None)
-    parser.add_argument("--adapter-name", default="cuad-qwen35-4b")
-    parser.add_argument("--served-model-name", default="cuad-qwen35-4b")
+    parser.add_argument("--adapter-name", default="cuad-qwen38-27b-fp8")
+    parser.add_argument("--served-model-name", default="cuad-qwen38-27b-fp8")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--max-model-len", type=int, default=32768)
+    parser.add_argument("--max-model-len", type=int, default=DEFAULT_MAX_SEQ_LENGTH)
     parser.add_argument("--max-lora-rank", type=int, default=32)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()

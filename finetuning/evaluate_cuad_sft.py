@@ -8,7 +8,7 @@ import importlib.util
 import json
 import time
 from collections import defaultdict
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,11 +17,11 @@ from typing import Any
 try:
     from .cuad_demo import evaluate_entry
     from .cuad_sft_data import _TextPromptModel, render_cuad_messages
-    from .train_cuad_sft import CuadJsonlDataset, _text_messages, apply_sft_chat_template
+    from .train_cuad_sft import DEFAULT_MODEL_ID, CuadJsonlDataset, _text_messages, apply_sft_chat_template
 except ImportError:
     from cuad_demo import evaluate_entry
     from cuad_sft_data import _TextPromptModel, render_cuad_messages
-    from train_cuad_sft import CuadJsonlDataset, _text_messages, apply_sft_chat_template
+    from train_cuad_sft import DEFAULT_MODEL_ID, CuadJsonlDataset, _text_messages, apply_sft_chat_template
 
 from palimpzest.constants import Cardinality
 from palimpzest.query.generators.generators import get_json_from_answer
@@ -54,13 +54,51 @@ class InferenceWalltimeLogger:
         self.handle.close()
 
 
-def _model_kwargs(use_flash_attention: bool) -> dict[str, Any]:
+def _synchronize_cuda() -> None:
     import torch
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def _cuda_memory() -> dict[str, int] | None:
+    import torch
+
+    if not torch.cuda.is_available():
+        return None
+    return {
+        "allocated_bytes": int(torch.cuda.memory_allocated()),
+        "reserved_bytes": int(torch.cuda.memory_reserved()),
+        "max_allocated_bytes": int(torch.cuda.max_memory_allocated()),
+    }
+
+
+def _compile_debug() -> dict[str, Any]:
+    try:
+        from torch._dynamo.utils import counters
+
+        return {
+            str(group): {str(key): int(value) for key, value in values.items() if value}
+            for group, values in counters.items()
+            if values
+        }
+    except Exception:
+        return {}
+
+
+def _model_kwargs(use_flash_attention: bool, model_id: str | None = None) -> dict[str, Any]:
+    import torch
+    from transformers.utils.quantization_config import FineGrainedFP8Config
 
     model_kwargs: dict[str, Any] = {
         "torch_dtype": torch.bfloat16,
         "device_map": {"": 0},
     }
+    if model_id is not None and model_id.lower().endswith("-fp8"):
+        # Match the BF16 base representation used by the SFT trainer.  The
+        # compressed FP8 matmul is inference-capable but its adapter-wrapped
+        # layers can expose Float8 weights where native PEFT expects BF16.
+        model_kwargs["quantization_config"] = FineGrainedFP8Config(dequantize=True)
     if use_flash_attention and importlib.util.find_spec("flash_attn") is not None:
         model_kwargs["attn_implementation"] = "flash_attention_2"
     return model_kwargs
@@ -87,16 +125,25 @@ def _load_base_model(model_id: str, use_flash_attention: bool = True):
     from transformers import AutoModelForCausalLM
 
     _validate_single_cuda_device()
-    model = AutoModelForCausalLM.from_pretrained(model_id, **_model_kwargs(use_flash_attention))
+    model = AutoModelForCausalLM.from_pretrained(model_id, **_model_kwargs(use_flash_attention, model_id))
+    _synchronize_cuda()
     model.eval()
     return model
 
 
 def _load_adapter_model(model_id: str, checkpoint: Path, use_flash_attention: bool = True):
-    from peft import PeftModel
-
     base = _load_base_model(model_id, use_flash_attention)
-    model = PeftModel.from_pretrained(base, str(checkpoint))
+    if hasattr(base, "load_adapter"):
+        # Keep the same native adapter representation used by training.  It
+        # also avoids wrapping the FP8 base in a legacy PeftModel wrapper.
+        base.load_adapter(str(checkpoint), adapter_name="default", is_trainable=False)
+        base.set_adapter("default")
+        base.enable_adapters()
+        model = base
+    else:
+        from peft import PeftModel
+
+        model = PeftModel.from_pretrained(base, str(checkpoint))
     model.eval()
     tokenizer = _load_tokenizer(
         model_id,
@@ -125,10 +172,23 @@ def _load_model(model_id: str, checkpoint: Path, use_flash_attention: bool = Tru
     return _load_merged_model(checkpoint, model_id, use_flash_attention)
 
 
+@contextmanager
 def _adapter_context(model: Any, adapter_enabled: bool | None):
     if adapter_enabled is False and hasattr(model, "disable_adapter"):
-        return model.disable_adapter()
-    return nullcontext()
+        with model.disable_adapter():
+            yield
+        return
+    if adapter_enabled is False and hasattr(model, "disable_adapters"):
+        model.disable_adapters()
+        try:
+            yield
+        finally:
+            model.enable_adapters()
+        return
+    if adapter_enabled is True and hasattr(model, "enable_adapters"):
+        model.enable_adapters()
+    with nullcontext():
+        yield
 
 
 def _completion_for_row(
@@ -137,9 +197,12 @@ def _completion_for_row(
     row: dict[str, Any],
     max_new_tokens: int,
     adapter_enabled: bool | None = None,
+    timing: dict[str, Any] | None = None,
 ) -> str:
     import torch
 
+    started_perf = time.perf_counter()
+    template_started = time.perf_counter()
     messages = _text_messages(row["messages"])
     prompt_inputs = apply_sft_chat_template(
         tokenizer,
@@ -148,8 +211,11 @@ def _completion_for_row(
         add_generation_prompt=True,
         return_tensors="pt",
     ).to(model.device)
+    template_and_transfer_seconds = time.perf_counter() - template_started
     input_ids = prompt_inputs["input_ids"]
     attention_mask = prompt_inputs.get("attention_mask")
+    _synchronize_cuda()
+    generate_started = time.perf_counter()
     with _adapter_context(model, adapter_enabled), torch.inference_mode():
         generated = model.generate(
             input_ids=input_ids,
@@ -158,8 +224,26 @@ def _completion_for_row(
             do_sample=False,
             pad_token_id=tokenizer.pad_token_id,
         )
+    _synchronize_cuda()
+    generate_seconds = time.perf_counter() - generate_started
     completion_ids = generated[0, input_ids.shape[-1] :]
-    return tokenizer.decode(completion_ids, skip_special_tokens=True)
+    decode_started = time.perf_counter()
+    completion = tokenizer.decode(completion_ids, skip_special_tokens=True)
+    decode_seconds = time.perf_counter() - decode_started
+    if timing is not None:
+        timing.update(
+            {
+                "prompt_tokens": int(input_ids.shape[-1]),
+                "completion_tokens": int(completion_ids.shape[-1]),
+                "template_and_transfer_seconds": template_and_transfer_seconds,
+                "generate_seconds": generate_seconds,
+                "decode_seconds": decode_seconds,
+                "total_generation_seconds": time.perf_counter() - started_perf,
+                "cuda_memory": _cuda_memory(),
+                "torch_compile_counters": _compile_debug(),
+            }
+        )
+    return completion
 
 
 def _normalize_predictions(value: Any) -> list[str]:
@@ -234,6 +318,9 @@ def _evaluate_rows(
     grounded_predictions = total_predictions = 0
     per_category = defaultdict(lambda: [0, 0, 0])
     records = []
+    row_seconds: list[float] = []
+    generation_seconds: list[float] = []
+    first_generation_timing: dict[str, Any] | None = None
     started_perf = time.perf_counter()
     total_rows = len(selected_rows)
     if timing_logger is not None:
@@ -246,7 +333,17 @@ def _evaluate_rows(
 
     for row_index, row in enumerate(selected_rows, start=1):
         row_started_perf = time.perf_counter()
-        completion = _completion_for_row(model, tokenizer, row, max_new_tokens, adapter_enabled)
+        row_timing: dict[str, Any] = {}
+        completion = _completion_for_row(
+            model,
+            tokenizer,
+            row,
+            max_new_tokens,
+            adapter_enabled,
+            timing=row_timing,
+        )
+        if row_index == 1:
+            first_generation_timing = dict(row_timing)
         parse_failed = False
         try:
             parsed = get_json_from_answer(completion, _TextPromptModel(), Cardinality.ONE_TO_ONE)
@@ -289,6 +386,10 @@ def _evaluate_rows(
 
         if timing_logger is not None and (row_index % timing_log_every == 0 or row_index == total_rows):
             elapsed = time.perf_counter() - started_perf
+            row_elapsed = time.perf_counter() - row_started_perf
+            row_seconds.append(row_elapsed)
+            if row_timing.get("generate_seconds") is not None:
+                generation_seconds.append(float(row_timing["generate_seconds"]))
             timing_logger.write(
                 "inference_progress",
                 model_role=model_role,
@@ -296,9 +397,16 @@ def _evaluate_rows(
                 completed_rows=row_index,
                 total_rows=total_rows,
                 elapsed_seconds=elapsed,
-                last_row_seconds=time.perf_counter() - row_started_perf,
+                last_row_seconds=row_elapsed,
                 rows_per_second=row_index / elapsed if elapsed > 0 else None,
+                last_row_timing=row_timing,
+                first_row_timing=first_generation_timing if row_index == total_rows else None,
             )
+        else:
+            row_elapsed = time.perf_counter() - row_started_perf
+            row_seconds.append(row_elapsed)
+            if row_timing.get("generate_seconds") is not None:
+                generation_seconds.append(float(row_timing["generate_seconds"]))
 
     elapsed = time.perf_counter() - started_perf
     metrics = _finalize_counts(tp, fp, fn)
@@ -311,6 +419,18 @@ def _evaluate_rows(
             "inference_walltime_seconds": elapsed,
             "average_row_seconds": elapsed / len(selected_rows) if selected_rows else 0.0,
             "rows_per_second": len(selected_rows) / elapsed if elapsed > 0 else 0.0,
+            "first_row_seconds": row_seconds[0] if row_seconds else None,
+            "steady_state_average_row_seconds": (
+                sum(row_seconds[1:]) / len(row_seconds[1:]) if len(row_seconds) > 1 else None
+            ),
+            "first_row_generation_seconds": (
+                first_generation_timing.get("generate_seconds") if first_generation_timing else None
+            ),
+            "steady_state_average_generation_seconds": (
+                sum(generation_seconds[1:]) / len(generation_seconds[1:]) if len(generation_seconds) > 1 else None
+            ),
+            "first_row_includes_compile_or_kernel_warmup": bool(first_generation_timing),
+            "torch_compile_counters": _compile_debug(),
             "parse_failures": parse_failures,
             "parse_success_rate": 1.0 - parse_failures / len(selected_rows) if selected_rows else 0.0,
             "missing_keys": missing_keys,
@@ -486,25 +606,100 @@ def _run_comparison(
     timing_log_every: int = 10,
 ) -> dict[str, Any]:
     if (checkpoint / "adapter_config.json").exists():
+        load_started = time.perf_counter()
         model, tokenizer = _load_adapter_model(model_id, checkpoint, use_flash_attention)
+        if timing_logger is not None:
+            timing_logger.write(
+                "model_load",
+                model_role="adapter_base_plus_lora",
+                model_id=model_id,
+                checkpoint=str(checkpoint),
+                load_seconds=time.perf_counter() - load_started,
+                model_class=type(model).__name__,
+                model_is_quantized=bool(getattr(model, "is_quantized", False)),
+                model_is_compiled=bool(hasattr(model, "_orig_mod")),
+                cuda_memory=_cuda_memory(),
+            )
         vanilla_result = _evaluate_rows(model, tokenizer, selected_rows, max_new_tokens, "vanilla", model_id, mode=mode, adapter_enabled=False, timing_logger=timing_logger, timing_log_every=timing_log_every)
         sft_result = _evaluate_rows(model, tokenizer, selected_rows, max_new_tokens, "sft", model_id, mode=mode, adapter_enabled=True, timing_logger=timing_logger, timing_log_every=timing_log_every)
         _release_model(model)
     else:
+        load_started = time.perf_counter()
         vanilla_model = _load_base_model(model_id, use_flash_attention)
+        if timing_logger is not None:
+            timing_logger.write(
+                "model_load",
+                model_role="vanilla",
+                model_id=model_id,
+                checkpoint=None,
+                load_seconds=time.perf_counter() - load_started,
+                model_class=type(vanilla_model).__name__,
+                model_is_quantized=bool(getattr(vanilla_model, "is_quantized", False)),
+                model_is_compiled=bool(hasattr(vanilla_model, "_orig_mod")),
+                cuda_memory=_cuda_memory(),
+            )
         vanilla_result = _evaluate_rows(vanilla_model, _load_tokenizer(model_id), selected_rows, max_new_tokens, "vanilla", model_id, mode=mode, timing_logger=timing_logger, timing_log_every=timing_log_every)
         _release_model(vanilla_model)
+        load_started = time.perf_counter()
         sft_model, sft_tokenizer = _load_merged_model(checkpoint, model_id, use_flash_attention)
+        if timing_logger is not None:
+            timing_logger.write(
+                "model_load",
+                model_role="sft_merged",
+                model_id=model_id,
+                checkpoint=str(checkpoint),
+                load_seconds=time.perf_counter() - load_started,
+                model_class=type(sft_model).__name__,
+                model_is_quantized=bool(getattr(sft_model, "is_quantized", False)),
+                model_is_compiled=bool(hasattr(sft_model, "_orig_mod")),
+                cuda_memory=_cuda_memory(),
+            )
         sft_result = _evaluate_rows(sft_model, sft_tokenizer, selected_rows, max_new_tokens, "sft", model_id, mode=mode, timing_logger=timing_logger, timing_log_every=timing_log_every)
         _release_model(sft_model)
     return {"vanilla": vanilla_result.metrics, "sft": sft_result.metrics, "delta": _metric_delta(vanilla_result.metrics, sft_result.metrics)}
 
 
+def _estimate_runtime_seconds(metrics: dict[str, Any], target_rows: int, measured_rows: int) -> float | None:
+    if target_rows <= 0 or measured_rows <= 0:
+        return 0.0
+    first = metrics.get("first_row_seconds")
+    steady = metrics.get("steady_state_average_row_seconds")
+    average = metrics.get("average_row_seconds")
+    if isinstance(first, (int, float)) and isinstance(steady, (int, float)):
+        return float(first) + max(target_rows - 1, 0) * float(steady)
+    if isinstance(average, (int, float)):
+        return float(average) * target_rows
+    return None
+
+
+def _inference_runtime_estimate(
+    comparison: dict[str, Any],
+    *,
+    target_rows: int,
+    measured_rows: int,
+) -> dict[str, Any]:
+    vanilla_seconds = _estimate_runtime_seconds(comparison["vanilla"], target_rows, measured_rows)
+    sft_seconds = _estimate_runtime_seconds(comparison["sft"], target_rows, measured_rows)
+    return {
+        "target_rows": target_rows,
+        "measured_rows": measured_rows,
+        "vanilla_seconds": vanilla_seconds,
+        "sft_seconds": sft_seconds,
+        "both_models_seconds": (
+            vanilla_seconds + sft_seconds
+            if vanilla_seconds is not None and sft_seconds is not None
+            else None
+        ),
+        "method": "first measured row plus steady-state average of remaining measured rows",
+        "includes_model_load_seconds": False,
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Compare vanilla and SFT Qwen3.5 CUAD performance")
+    parser = argparse.ArgumentParser(description="Compare vanilla and SFT Qwen3.8-27B-FP8 CUAD performance")
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--data-dir", type=Path, required=True)
-    parser.add_argument("--model-id", default="Qwen/Qwen3.5-4B")
+    parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
     parser.add_argument("--mode", choices=["all", "singleton", "grouped", "randomized", "canonical"], default="all")
     parser.add_argument("--max-new-tokens", type=_positive_int, default=8192)
     parser.add_argument("--limit", type=_positive_int, default=None)
@@ -520,7 +715,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    selected_rows = _prepare_rows(_load_rows(args.data_dir), args.mode, args.limit)
+    all_rows = _load_rows(args.data_dir)
+    full_selected_rows = _prepare_rows(all_rows, args.mode, None)
+    selected_rows = _prepare_rows(all_rows, args.mode, args.limit)
     output_path = args.output or (args.checkpoint.parent / "comparison.json")
     timing_log_path = output_path.parent / "inference_walltime.jsonl"
     timing_logger = InferenceWalltimeLogger(timing_log_path)
@@ -543,6 +740,11 @@ def main() -> None:
             "rows": len(selected_rows),
             "model_id": args.model_id,
             "inference_walltime_log": str(timing_log_path),
+            "inference_runtime_estimate": _inference_runtime_estimate(
+                comparison,
+                target_rows=len(full_selected_rows),
+                measured_rows=len(selected_rows),
+            ),
         }
     )
     _write_reports(comparison, output_path, output_path.parent / "sft_plots")
