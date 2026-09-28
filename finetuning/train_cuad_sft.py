@@ -96,7 +96,7 @@ class TrainConfig:
         if self.max_seq_length <= 0:
             raise ValueError("max_seq_length must be positive")
         if self.per_device_train_batch_size != 1 or self.per_device_eval_batch_size != 1:
-            raise ValueError("The CUAD SFT implementation is configured for batch size 1 on one L40S")
+            raise ValueError("The CUAD SFT implementation is configured for batch size 1 on one GPU")
         if self.gradient_accumulation_steps <= 0:
             raise ValueError("gradient_accumulation_steps must be positive")
         if self.num_train_epochs <= 0 or self.learning_rate <= 0:
@@ -332,6 +332,18 @@ def _load_config(path: Path) -> TrainConfig:
         return TrainConfig.from_mapping(yaml.safe_load(handle) or {})
 
 
+def _model_kwargs(torch_module: Any, use_flash_attention: bool) -> dict[str, Any]:
+    model_kwargs: dict[str, Any] = {
+        "torch_dtype": torch_module.bfloat16,
+        "device_map": {"": 0},
+    }
+    if use_flash_attention and importlib.util.find_spec("flash_attn_interface") is not None:
+        model_kwargs["attn_implementation"] = "flash_attention_3"
+    elif use_flash_attention:
+        LOGGER.warning("flash_attn_interface is unavailable; falling back to SDPA attention")
+    return model_kwargs
+
+
 def _load_model_and_tokenizer(config: TrainConfig) -> tuple[Any, Any, list[str]]:
     import torch
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
@@ -349,14 +361,7 @@ def _load_model_and_tokenizer(config: TrainConfig) -> tuple[Any, Any, list[str]]
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model_kwargs: dict[str, Any] = {
-        "torch_dtype": torch.bfloat16,
-        "device_map": {"": 0},
-    }
-    if config.flash_attention and importlib.util.find_spec("flash_attn") is not None:
-        model_kwargs["attn_implementation"] = "flash_attention_2"
-    elif config.flash_attention:
-        LOGGER.warning("flash_attn is unavailable; falling back to SDPA attention")
+    model_kwargs = _model_kwargs(torch, config.flash_attention)
     if config.qlora:
         model_kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True,

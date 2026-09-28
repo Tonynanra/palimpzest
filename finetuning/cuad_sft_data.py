@@ -279,16 +279,25 @@ def build_sft_examples(config: SFTDataConfig) -> tuple[list[dict[str, Any]], dic
             _stable_hash(_normalize_source_text(title_to_metadata[title]["contract"])),
         )
 
-    train_sources, dev_sources = _split_source_hashes(
-        title_to_source_hash.values(),
-        config.train_fraction,
-        config.seed,
-    )
+    source_hashes = set(title_to_source_hash.values())
+    if config.split == "train":
+        train_sources, dev_sources = _split_source_hashes(
+            source_hashes,
+            config.train_fraction,
+            config.seed,
+        )
+        test_sources: set[str] = set()
+    else:
+        # The CUAD test split is a final holdout.  Keep every test source in a
+        # single test artifact and never label any of it as train data.
+        train_sources = set()
+        dev_sources = set()
+        test_sources = source_hashes
 
     examples: list[dict[str, Any]] = []
     for title in titles:
         source_hash = title_to_source_hash[title]
-        dataset_split = "train" if source_hash in train_sources else "dev"
+        dataset_split = "test" if config.split == "test" else "train" if source_hash in train_sources else "dev"
         metadata = title_to_metadata[title]
         labels = labels_by_title.get(title, {category: [] for category in categories})
         title_seed = int(source_hash[:16], 16) ^ config.seed
@@ -344,8 +353,10 @@ def build_sft_examples(config: SFTDataConfig) -> tuple[list[dict[str, Any]], dic
         "chunk_records": len(titles),
         "train_source_hashes": sorted(train_sources),
         "dev_source_hashes": sorted(dev_sources),
+        "test_source_hashes": sorted(test_sources),
         "train_examples": sum(example["split"] == "train" for example in examples),
         "dev_examples": sum(example["split"] == "dev" for example in examples),
+        "test_examples": sum(example["split"] == "test" for example in examples),
     }
     return examples, manifest
 
@@ -356,7 +367,8 @@ def write_sft_artifacts(
     output_dir: Path,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-    for split in ("train", "dev"):
+    artifact_splits = ("train", "dev") if manifest.get("source_split") == "train" else ("test",)
+    for split in artifact_splits:
         path = output_dir / f"{split}.jsonl"
         with path.open("w", encoding="utf-8") as handle:
             for example in examples:
@@ -390,10 +402,13 @@ def main() -> None:
     )
     examples, manifest = build_sft_examples(config)
     write_sft_artifacts(examples, manifest, config.output_dir)
-    print(
-        f"Wrote {manifest['train_examples']} train and {manifest['dev_examples']} dev examples "
-        f"to {config.output_dir}"
-    )
+    if config.split == "test":
+        print(f"Wrote {manifest['test_examples']} test examples to {config.output_dir}")
+    else:
+        print(
+            f"Wrote {manifest['train_examples']} train and {manifest['dev_examples']} dev examples "
+            f"to {config.output_dir}"
+        )
 
 
 if __name__ == "__main__":
