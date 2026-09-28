@@ -6,6 +6,7 @@ import argparse
 import gc
 import importlib.util
 import json
+import logging
 import time
 from collections import defaultdict
 from contextlib import nullcontext
@@ -25,6 +26,8 @@ except ImportError:
 
 from palimpzest.constants import Cardinality
 from palimpzest.query.generators.generators import get_json_from_answer
+
+LOGGER = logging.getLogger("cuad-sft-eval")
 
 
 @dataclass
@@ -61,8 +64,10 @@ def _model_kwargs(use_flash_attention: bool) -> dict[str, Any]:
         "torch_dtype": torch.bfloat16,
         "device_map": {"": 0},
     }
-    if use_flash_attention and importlib.util.find_spec("flash_attn") is not None:
-        model_kwargs["attn_implementation"] = "flash_attention_2"
+    if use_flash_attention and importlib.util.find_spec("flash_attn_interface") is not None:
+        model_kwargs["attn_implementation"] = "flash_attention_3"
+    elif use_flash_attention:
+        LOGGER.warning("flash_attn_interface is unavailable; falling back to SDPA attention")
     return model_kwargs
 
 
@@ -457,14 +462,15 @@ def _write_reports(comparison: dict[str, Any], output_path: Path, plot_dir: Path
     _plot_comparison(comparison, plot_dir)
 
 
-def _load_rows(data_dir: Path) -> list[dict[str, Any]]:
+def _load_rows(data_dir: Path, split: str = "all") -> list[dict[str, Any]]:
     rows = []
-    for split in ("train", "dev"):
-        path = data_dir / f"{split}.jsonl"
+    splits = ("train", "dev", "test") if split == "all" else (split,)
+    for split_name in splits:
+        path = data_dir / f"{split_name}.jsonl"
         if path.exists():
             rows.extend(CuadJsonlDataset(path).rows)
     if not rows:
-        raise FileNotFoundError(f"No train.jsonl or dev.jsonl found in {data_dir}")
+        raise FileNotFoundError(f"No {split}.jsonl found in {data_dir}")
     return rows
 
 
@@ -506,6 +512,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-dir", type=Path, required=True)
     parser.add_argument("--model-id", default="Qwen/Qwen3.5-4B")
     parser.add_argument("--mode", choices=["all", "singleton", "grouped", "randomized", "canonical"], default="all")
+    parser.add_argument("--split", choices=["all", "train", "dev", "test"], default="all")
     parser.add_argument("--max-new-tokens", type=_positive_int, default=8192)
     parser.add_argument("--limit", type=_positive_int, default=None)
     parser.add_argument("--output", type=Path, default=None)
@@ -520,7 +527,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    selected_rows = _prepare_rows(_load_rows(args.data_dir), args.mode, args.limit)
+    selected_rows = _prepare_rows(_load_rows(args.data_dir, args.split), args.mode, args.limit)
     output_path = args.output or (args.checkpoint.parent / "comparison.json")
     timing_log_path = output_path.parent / "inference_walltime.jsonl"
     timing_logger = InferenceWalltimeLogger(timing_log_path)
@@ -540,6 +547,7 @@ def main() -> None:
     comparison.update(
         {
             "mode": args.mode,
+            "data_split": args.split,
             "rows": len(selected_rows),
             "model_id": args.model_id,
             "inference_walltime_log": str(timing_log_path),

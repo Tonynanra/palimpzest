@@ -5,7 +5,6 @@ from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_INPUT_DIR = REPO_ROOT / "testdata" / "cuad-data"
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "testdata" / "cuad-chunk"
