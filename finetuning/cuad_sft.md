@@ -6,13 +6,13 @@ The implementation trains a Qwen3.5-4B LoRA/QLoRA adapter on the local CUAD chun
 ## Workflow
 
 ```text
-testdata/cuad-chunk + testdata/cuad-data
+testdata/cuad/chunks + testdata/cuad/raw
         │
         ▼
 cuad_sft_data.py
         │  randomized one-convert views
         ▼
-finetuning/artifacts/cuad-sft/{train,dev}.jsonl
+testdata/cuad/sft/train-dev/{train,dev}.jsonl
         │
         ▼
 train_cuad_sft.py
@@ -37,21 +37,30 @@ The assistant completion ends with `---`, matching the existing Palimpzest conve
 
 | File | Purpose |
 |---|---|
-| [cuad_sft_data.py](cuad_sft_data.py) | Builds deterministic train/dev JSONL examples. |
+| [cuad_data.py](cuad_data.py) | Shared download, JSON/JSONL loading, chunk generation, grouping, labels, and seeded sampling. |
+| [cuad_schema.py](cuad_schema.py) | CUAD categories, normalization, validation, and output-field descriptions. |
+| [setup_cuad_data.py](setup_cuad_data.py) | Downloads raw CUAD data without depending on the historical research directory. |
+| [cuad_sft_data.py](cuad_sft_data.py) | Builds deterministic train/dev and isolated test JSONL examples. |
 | [sft_config.yaml](sft_config.yaml) | Default Qwen3.5 training configuration. |
 | [train_cuad_sft.py](train_cuad_sft.py) | Loads Qwen3.5, attaches LoRA/QLoRA, masks prompt tokens, and trains. |
 | [evaluate_cuad_sft.py](evaluate_cuad_sft.py) | Generates predictions and reports CUAD extraction metrics. |
 | [merge_cuad_sft_adapter.py](merge_cuad_sft_adapter.py) | Merges a PEFT adapter into a standalone checkpoint. |
 | [serve_cuad_sft.py](serve_cuad_sft.py) | Launches adapter or merged-model vLLM serving. |
 | [cuad_qwen_benchmark.py](cuad_qwen_benchmark.py) | Existing Palimpzest benchmark, extended with local endpoint and `convert_mode` support. |
-| [generate_cuad_chunk_dataset.py](generate_cuad_chunk_dataset.py) | Existing generator for the `cuad-chunk` dataset. SFT consumes the generated files; it does not regenerate them automatically. |
+| [generate_cuad_chunk_dataset.py](generate_cuad_chunk_dataset.py) | CLI adapter for `cuad-chunk` generation. SFT consumes the generated files; it does not regenerate them automatically. |
 | [../src/palimpzest/prompts/prompt_factory.py](../src/palimpzest/prompts/prompt_factory.py) | Existing prompt factory with an opt-in provided-field-order mode for SFT data. |
 
-Generated data, checkpoints, and merged models are ignored under `finetuning/artifacts/`.
+Raw data, chunks, and generated SFT datasets are ignored under `testdata/cuad/`.
+Checkpoints, models, logs, metrics, and plots are stored under `finetuning/artifacts/`.
+See [the dataset layout and relocation mapping](../testdata/README.md#cuad) for existing run records.
 
 ## Dataset construction
 
-The builder uses the existing `cuad-chunk` records and aggregates labels through the existing CUAD label logic.
+The builder reads the existing `cuad-chunk` file once and aggregates labels directly
+from ordered annotations grouped by title. Benchmark loading shares the same
+grouping and label logic. This avoids flattening and regrouping annotations or
+converting labels through a DataFrame; text chunking, source hashes, seeded views,
+prompts, and artifact serialization retain their existing behavior.
 Train/dev assignment is made at source-contract content-hash level, before chunks are separated, preventing chunks from the same source contract from crossing the split.
 
 Seven views are generated per chunk:
@@ -70,20 +79,20 @@ Each subset is shuffled. Empty labels are retained so the model learns when to r
 
 ```bash
 ./.venv/bin/python finetuning/cuad_sft_data.py \
-  --chunk-data-dir testdata/cuad-chunk \
-  --raw-data-dir testdata/cuad-data \
+  --chunk-data-dir testdata/cuad/chunks \
+  --raw-data-dir testdata/cuad/raw \
   --split train \
-  --output-dir finetuning/artifacts/cuad-sft \
+  --output-dir testdata/cuad/sft/train-dev \
   --seed 42 \
   --train-fraction 0.9
 ```
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--chunk-data-dir` | `testdata/cuad-chunk` | Chunk-native CUAD input directory. |
-| `--raw-data-dir` | `testdata/cuad-data` | Raw CUAD directory used for source hashing. |
+| `--chunk-data-dir` | `testdata/cuad/chunks` | Chunk-native CUAD input directory. |
+| `--raw-data-dir` | `testdata/cuad/raw` | Raw CUAD directory used for source hashing. |
 | `--split` | `train` | CUAD source split: `train` or `test`. |
-| `--output-dir` | `finetuning/artifacts/cuad-sft` | JSONL and manifest output directory. |
+| `--output-dir` | `testdata/cuad/sft/train-dev` for `train`; `testdata/cuad/sft/test` for `test` | JSONL and manifest directory; an explicit override takes precedence. |
 | `--seed` | `42` | Split and view-sampling seed. |
 | `--train-fraction` | `0.9` | Source-contract fraction assigned to training. |
 
@@ -93,6 +102,17 @@ Outputs:
 - `dev.jsonl`
 - `manifest.json`
 
+When `--split test` is selected, the builder defaults to `testdata/cuad/sft/test`,
+containing `test.jsonl` and `manifest.json`. The holdout is used only for standalone
+test evaluation; training reads `testdata/cuad/sft/train-dev`.
+
+```bash
+./.venv/bin/python finetuning/cuad_sft_data.py --split test
+```
+
+The Slurm workflow reuses non-empty train/dev and test JSONL files already present
+at these locations, building only missing bundles.
+
 ## Training configuration
 
 The checked-in [sft_config.yaml](sft_config.yaml) currently contains:
@@ -101,8 +121,11 @@ The checked-in [sft_config.yaml](sft_config.yaml) currently contains:
 model:
   id: Qwen/Qwen3.5-4B
 
+data:
+  dir: testdata/cuad/sft/train-dev
+
 training:
-  max_seq_length: 32768
+  max_seq_length: 36864
   per_device_train_batch_size: 1
   per_device_eval_batch_size: 1
   gradient_accumulation_steps: 4
@@ -119,7 +142,7 @@ training:
 
 The training artifact directory is owned by `train_cuad_sft.py`, not this YAML file. It defaults to `finetuning/artifacts/cuad-sft-run` and can be changed with `--output-dir`.
 
-The GH200 workflow uses `qlora: false`, FlashAttention2, and one visible CUDA device. The base model is loaded in BF16 and only the LoRA adapter parameters are trainable.
+The H200 workflow uses `qlora: false`, FlashAttention-3, and one visible CUDA device. The base model is loaded in BF16 and only the LoRA adapter parameters are trainable. When `training.flash_attention` is true, the trainer and evaluator request `flash_attention_3` when `flash_attn_interface` is installed and warn before falling back to SDPA when it is unavailable.
 
 The trainer:
 
@@ -167,7 +190,8 @@ Each checkpoint event records the checkpoint path, global step, epoch, UTC times
 ```bash
 ./.venv/bin/python finetuning/evaluate_cuad_sft.py \
   --checkpoint finetuning/artifacts/cuad-sft-run/adapter \
-  --data-dir finetuning/artifacts/cuad-sft \
+  --data-dir testdata/cuad/sft/test \
+  --split test \
   --model-id Qwen/Qwen3.5-4B \
   --mode all \
   --output finetuning/artifacts/cuad-sft-run/comparison.json
@@ -179,9 +203,10 @@ The output directory contains `vanilla.json`, `sft.json`, `comparison.json`, and
 | Option | Default | Meaning |
 |---|---|---|
 | `--checkpoint` | required | Adapter directory or merged model directory. |
-| `--data-dir` | required | Directory containing `train.jsonl` and/or `dev.jsonl`. |
+| `--data-dir` | required | Directory containing `train.jsonl`, `dev.jsonl`, or `test.jsonl`. |
 | `--model-id` | `Qwen/Qwen3.5-4B` | Base model used with an adapter. |
 | `--mode` | `all` | `all`, `singleton`, `grouped`, `randomized`, or `canonical`. |
+| `--split` | `all` | Read all JSONL files or only `train`, `dev`, or `test`. |
 | `--max-new-tokens` | `8192` | Generation limit. |
 | `--limit` | unset | Optional row limit for a smoke evaluation. |
 | `--output` | checkpoint parent/`comparison.json` | Comparison JSON output path. The vanilla and SFT reports are written beside it. |
@@ -287,40 +312,33 @@ Important YAML settings include `dataset.mode`, `dataset.data_dir`, `split`, `nu
 The project defines these optional extras in [pyproject.toml](../pyproject.toml):
 
 ```bash
-./.venv/bin/pip install -e ".[sft,sft-serving,sft-kernels]"
+UV_CACHE_DIR=/tmp/palimpzest-uv-cache uv sync --all-extras
 ```
 
-Qwen3.5 may require a newer Transformers source checkout than the normal package constraint. The validated smoke environment used a current Transformers development build, FlashAttention2, and `flash-linear-attention`. `causal-conv1d` may require `nvcc` to build; if unavailable, Transformers uses its reference implementation, which is slower but does not prevent the tested 32k BF16 LoRA step from running.
+The locked H200 stack uses Python 3.12, CUDA 13.0 Torch 2.13, Transformers 5.17, vLLM 0.30, sentence-transformers 6.1, FlashAttention-3 from the Hopper subdirectory of Dao-AILab/flash-attention, flash-linear-attention 0.5.2 with CUDA support, and causal-conv1d 1.7. FlashAttention-3 and causal-conv1d are built without isolation after Torch is installed.
 
-## Slurm job
+## H200 Slurm validation
 
-[run_cuad_sft.slurm](run_cuad_sft.slurm) runs the complete workflow on one node:
+The resource and storage choices use the repository `.venv` and durable NFS-backed paths.
+
+[run_h200_gpu_validation.slurm](run_h200_gpu_validation.slurm) runs the GPU-only validation workflow on one node:
 
 - Account: `quanta`
-- Partition: `quanta-gh200`
+- Partition: `quanta-h200`
 - QoS: `quanta-main`
-- Node constraint: `nvidia_gh200_480gb`
-- CPUs: 36
-- RAM: 240 GB
+- Node: `quanta-h200-1`
+- Constraint: `nvidia_h200`
+- CPUs: 16
+- RAM: 32 GB
 - GPUs: 1
-- Time limit: 24 hours
+- Time limit: short validation allocation
 - Environment: repository `.venv`
-- Training: full BF16 LoRA, 3 epochs, 32k-token ceiling
-- Evaluation: all-field vanilla-vs-SFT comparison with fixed `sft_plots/`
+- Validation: H200 identity, FA3 `sm_90a`, BF16 FA3/SDPA numerics, Qwen forward/backward, one-step LoRA SFT, dev/test evaluation, and local vLLM request
 
-The job requires the existing local inputs `testdata/cuad-data` and `testdata/cuad-chunk`; it does not download data on the compute node. The SFT JSONL files are rebuilt into the job-specific artifact directory before training.
+Submit it from any Slurm node with access to the checkout. Durable stdout, stderr, reports, and artifacts are written under `finetuning/artifacts/h200-gpu-validation/`; only disposable temporary files use node-local storage.
 
-Submit it from the repository root:
+From the repository root on any Slurm node:
 
 ```bash
-sbatch finetuning/run_cuad_sft.slurm
+sbatch finetuning/run_h200_gpu_validation.slurm
 ```
-
-Each job writes to `finetuning/artifacts/slurm/<job-id>/`:
-
-- `data/` — generated train/dev SFT JSONL and manifest;
-- `training/` — checkpoints, adapter, training manifest, and training walltime log;
-- `comparison.json`, `vanilla.json`, and `sft.json`;
-- `sft_plots/` — comparison figures;
-- `inference_walltime.jsonl` — periodic vanilla/SFT inference timing events;
-- `data_build.log`, `training.log`, and `evaluation.log`.

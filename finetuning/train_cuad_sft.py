@@ -15,6 +15,11 @@ from typing import Any
 
 import yaml
 
+try:
+    from .cuad_data import CuadJsonlDataset as CuadJsonlDataset
+except ImportError:
+    from cuad_data import CuadJsonlDataset as CuadJsonlDataset
+
 LOGGER = logging.getLogger("cuad-sft")
 DEFAULT_MODEL_ID = "Qwen/Qwen3.5-4B"
 DEFAULT_MAX_SEQ_LENGTH = 32768
@@ -42,7 +47,7 @@ TARGET_MODULE_SUFFIXES = (
 @dataclass(frozen=True)
 class TrainConfig:
     model_id: str = DEFAULT_MODEL_ID
-    data_dir: Path = Path("finetuning/artifacts/cuad-sft")
+    data_dir: Path = Path("testdata/cuad/sft/train-dev")
     output_dir: Path = DEFAULT_OUTPUT_DIR
     max_seq_length: int = DEFAULT_MAX_SEQ_LENGTH
     per_device_train_batch_size: int = 1
@@ -105,25 +110,6 @@ class TrainConfig:
             raise ValueError("LoRA rank and alpha must be positive")
         if not 0.0 <= self.lora_dropout < 1.0:
             raise ValueError("lora_dropout must be in [0, 1)")
-
-
-class CuadJsonlDataset:
-    def __init__(self, path: Path, limit: int | None = None):
-        self.path = path
-        with path.open(encoding="utf-8") as handle:
-            self.rows = [json.loads(line) for line in handle if line.strip()]
-        if limit is not None:
-            if limit <= 0:
-                raise ValueError("dataset limit must be positive")
-            self.rows = self.rows[:limit]
-        if not self.rows:
-            raise ValueError(f"No SFT examples found in {path}")
-
-    def __len__(self) -> int:
-        return len(self.rows)
-
-    def __getitem__(self, index: int) -> dict[str, Any]:
-        return self.rows[index]
 
 
 def apply_sft_chat_template(tokenizer: Any, messages: list[dict[str, str]], **kwargs: Any) -> Any:

@@ -2,331 +2,30 @@ import string
 
 import numpy as np
 import pandas as pd
-try:
-    from .cuad_data_loader import load_cuad_data
-except ImportError:
-    from cuad_data_loader import load_cuad_data
 
 import palimpzest as pz
 
-CUAD_CATEGORIES = [
-    {
-        "Category": "Document Name",
-        "Description": "The name of the contract",
-        "Answer Format": "Contract Name",
-        "Group": "Group: -",
-    },
-    {
-        "Category": "Parties",
-        "Description": "The two or more parties who signed the contract",
-        "Answer Format": "Entity or individual names",
-        "Group": "Group: -",
-    },
-    {
-        "Category": "Agreement Date",
-        "Description": "The date of the contract",
-        "Answer Format": "Date (mm/dd/yyyy)",
-        "Group": "Group: 1",
-    },
-    {
-        "Category": "Effective Date",
-        "Description": "The date when the contract is effective\u00a0",
-        "Answer Format": "Date (mm/dd/yyyy)",
-        "Group": "Group: 1",
-    },
-    {
-        "Category": "Expiration Date",
-        "Description": "On what date will the contract's initial term expire?",
-        "Answer Format": "Date (mm/dd/yyyy) / Perpetual",
-        "Group": "Group: 1",
-    },
-    {
-        "Category": "Renewal Term",
-        "Description": "What is the renewal term after the initial term expires? This includes automatic extensions and unilateral extensions with prior notice.",
-        "Answer Format": "[Successive] number of years/months / Perpetual",
-        "Group": "Group: 1",
-    },
-    {
-        "Category": "Notice Period to Terminate Renewal",
-        "Description": "What is the notice period required to terminate renewal?",
-        "Answer Format": "Number of days/months/year(s)",
-        "Group": "Group: 1",
-    },
-    {
-        "Category": "Governing Law",
-        "Description": "Which state/country's law governs the interpretation of the contract?",
-        "Answer Format": "Name of a US State / non-US Province, Country",
-        "Group": "Group: -",
-    },
-    {
-        "Category": "Most Favored Nation",
-        "Description": "Is there a clause that if a third party gets better terms on the licensing or sale of technology/goods/services described in the contract, the buyer of such technology/goods/services under the contract shall be entitled to those better terms?",
-        "Answer Format": "Yes/No",
-        "Group": "Group: -",
-    },
-    {
-        "Category": "Non-Compete",
-        "Description": "Is there a restriction on the ability of a party to compete with the counterparty or operate in a certain geography or business or technology sector?\u00a0",
-        "Answer Format": "Yes/No",
-        "Group": "Group: 2",
-    },
-    {
-        "Category": "Exclusivity",
-        "Description": "Is there an exclusive dealing\u00a0 commitment with the counterparty? This includes a commitment to procure all \u201crequirements\u201d from one party of certain technology, goods, or services or a prohibition on licensing or selling technology, goods or services to third parties, or a prohibition on\u00a0 collaborating or working with other parties), whether during the contract or\u00a0 after the contract ends (or both).",
-        "Answer Format": "Yes/No",
-        "Group": "Group: 2",
-    },
-    {
-        "Category": "No-Solicit of Customers",
-        "Description": "Is a party restricted from contracting or soliciting customers or partners of the counterparty, whether during the contract or after the contract ends (or both)?",
-        "Answer Format": "Yes/No",
-        "Group": "Group: 2",
-    },
-    {
-        "Category": "Competitive Restriction Exception",
-        "Description": "This category includes the exceptions or carveouts to Non-Compete, Exclusivity and No-Solicit of Customers above.",
-        "Answer Format": "Yes/No",
-        "Group": "Group: 2",
-    },
-    {
-        "Category": "No-Solicit of Employees",
-        "Description": "Is there a restriction on a party\u2019s soliciting or hiring employees and/or contractors from the\u00a0 counterparty, whether during the contract or after the contract ends (or both)?",
-        "Answer Format": "Yes/No",
-        "Group": "Group: -",
-    },
-    {
-        "Category": "Non-Disparagement",
-        "Description": "Is there a requirement on a party not to disparage the counterparty?",
-        "Answer Format": "Yes/No",
-        "Group": "Group: -",
-    },
-    {
-        "Category": "Termination for Convenience",
-        "Description": "Can a party terminate this\u00a0 contract without cause (solely by giving a notice and allowing a waiting\u00a0 period to expire)?",
-        "Answer Format": "Yes/No",
-        "Group": "Group: -",
-    },
-    {
-        "Category": "Rofr/Rofo/Rofn",
-        "Description": "Is there a clause granting one party a right of first refusal, right of first offer or right of first negotiation to purchase, license, market, or distribute equity interest, technology, assets, products or services?",
-        "Answer Format": "Yes/No",
-        "Group": "Group: -",
-    },
-    {
-        "Category": "Change of Control",
-        "Description": "Does one party have the right to terminate or is consent or notice required of the counterparty if such party undergoes a change of control, such as a merger, stock sale, transfer of all or substantially all of its assets or business, or assignment by operation of law?",
-        "Answer Format": "Yes/No",
-        "Group": "Group: 3",
-    },
-    {
-        "Category": "Anti-Assignment",
-        "Description": "Is consent or notice required of a party if the contract is assigned to a third party?",
-        "Answer Format": "Yes/No",
-        "Group": "Group: 3",
-    },
-    {
-        "Category": "Revenue/Profit Sharing",
-        "Description": "Is one party required to share revenue or profit with the counterparty for any technology, goods, or\u00a0services?",
-        "Answer Format": "Yes/No",
-        "Group": "Group: -",
-    },
-    {
-        "Category": "Price Restrictions",
-        "Description": "Is there a restriction on the\u00a0 ability of a party to raise or reduce prices of technology, goods, or\u00a0 services provided?",
-        "Answer Format": "Yes/No",
-        "Group": "Group: -",
-    },
-    {
-        "Category": "Minimum Commitment",
-        "Description": "Is there a minimum order size or minimum amount or units per-time period that one party must buy from the counterparty under the contract?",
-        "Answer Format": "Yes/No",
-        "Group": "Group: -",
-    },
-    {
-        "Category": "Volume Restriction",
-        "Description": "Is there a fee increase or consent requirement, etc. if one party\u2019s use of the product/services exceeds certain threshold?",
-        "Answer Format": "Yes/No",
-        "Group": "Group: -",
-    },
-    {
-        "Category": "IP Ownership Assignment",
-        "Description": "Does intellectual property created\u00a0 by one party become the property of the counterparty, either per the terms of the contract or upon the occurrence of certain events?",
-        "Answer Format": "Yes/No",
-        "Group": "Group: -",
-    },
-    {
-        "Category": "Joint IP Ownership",
-        "Description": "Is there any clause providing for joint or shared ownership of intellectual property between the parties to the contract?",
-        "Answer Format": "Yes/No",
-        "Group": "Group: -",
-    },
-    {
-        "Category": "License Grant",
-        "Description": "Does the contract contain a license granted by one party to its counterparty?",
-        "Answer Format": "Yes/No",
-        "Group": "Group: 4",
-    },
-    {
-        "Category": "Non-Transferable License",
-        "Description": "Does the contract limit the ability of a party to transfer the license being granted to a third party?",
-        "Answer Format": "Yes/No",
-        "Group": "Group: 4",
-    },
-    {
-        "Category": "Affiliate License-Licensor",
-        "Description": "Does the contract contain a license grant by affiliates of the licensor or that includes intellectual property of affiliates of the licensor?\u00a0",
-        "Answer Format": "Yes/No",
-        "Group": "Group: 4",
-    },
-    {
-        "Category": "Affiliate License-Licensee",
-        "Description": "Does the contract contain a license grant to a licensee (incl. sublicensor) and the affiliates of such licensee/sublicensor?",
-        "Answer Format": "Yes/No",
-        "Group": "Group: 4",
-    },
-    {
-        "Category": "Unlimited/All-You-Can-Eat-License",
-        "Description": "Is there a clause granting one party an \u201centerprise,\u201d \u201call you can eat\u201d or unlimited usage license?",
-        "Answer Format": "Yes/No",
-        "Group": "Group: 4",
-    },
-    {
-        "Category": "Irrevocable or Perpetual License",
-        "Description": "Does the contract contain a\u00a0 license grant that is irrevocable or perpetual?",
-        "Answer Format": "Yes/No",
-        "Group": "Group: 4",
-    },
-    {
-        "Category": "Source Code Escrow",
-        "Description": "Is one party required to deposit its source code into escrow with a third party, which can be released to the counterparty upon the occurrence of certain events (bankruptcy,\u00a0 insolvency, etc.)?",
-        "Answer Format": "Yes/No",
-        "Group": "Group: -",
-    },
-    {
-        "Category": "Post-Termination Services",
-        "Description": "Is a party subject to obligations after the termination or expiration of a contract, including any post-termination transition, payment, transfer of IP, wind-down, last-buy, or similar commitments?",
-        "Answer Format": "Yes/No",
-        "Group": "Group: 5",
-    },
-    {
-        "Category": "Audit Rights",
-        "Description": "Does a party have the right to\u00a0 audit the books, records, or physical locations of the counterparty to ensure compliance with the contract?",
-        "Answer Format": "Yes/No",
-        "Group": "Group: 5",
-    },
-    {
-        "Category": "Uncapped Liability",
-        "Description": "Is a party\u2019s liability uncapped upon the breach of its obligation in the contract? This also includes uncap liability for a particular type of breach such as IP infringement or breach of confidentiality obligation.",
-        "Answer Format": "Yes/No",
-        "Group": "Group: 6",
-    },
-    {
-        "Category": "Cap on Liability",
-        "Description": "Does the contract include a cap on liability upon the breach of a party\u2019s obligation? This includes time limitation for the counterparty to bring claims or maximum amount for recovery.",
-        "Answer Format": "Yes/No",
-        "Group": "Group: 6",
-    },
-    {
-        "Category": "Liquidated Damages",
-        "Description": "Does the contract contain a clause that would award either party liquidated damages for breach or a fee upon the termination of a contract (termination fee)?",
-        "Answer Format": "Yes/No",
-        "Group": "Group: -",
-    },
-    {
-        "Category": "Warranty Duration",
-        "Description": "What is the duration of any\u00a0 warranty against defects or errors in technology, products, or services\u00a0 provided under the contract?",
-        "Answer Format": "Number of months or years",
-        "Group": "Group: -",
-    },
-    {
-        "Category": "Insurance",
-        "Description": "Is there a requirement for insurance that must be maintained by one party for the benefit of the counterparty?",
-        "Answer Format": "Yes/No",
-        "Group": "Group: -",
-    },
-    {
-        "Category": "Covenant Not to Sue",
-        "Description": "Is a party restricted from contesting the validity of the counterparty\u2019s ownership of intellectual property or otherwise bringing a claim against the counterparty for matters unrelated to the contract?",
-        "Answer Format": "Yes/No",
-        "Group": "Group: -",
-    },
-    {
-        "Category": "Third Party Beneficiary",
-        "Description": "Is there a non-contracting party who is a beneficiary to some or all of the clauses in the contract and therefore can enforce its rights against a contracting party?",
-        "Answer Format": "Yes/No",
-        "Group": "Group: -",
-    },
-]
-
-DEFAULT_CUAD_CATEGORY_NAMES = [category["Category"] for category in CUAD_CATEGORIES]
+try:
+    from .cuad_data import build_label_records, load_cuad_records, select_records
+    from .cuad_data import load_cuad_data as load_cuad_data
+    from .cuad_schema import CUAD_CATEGORIES as CUAD_CATEGORIES
+    from .cuad_schema import DEFAULT_CUAD_CATEGORY_NAMES as DEFAULT_CUAD_CATEGORY_NAMES
+    from .cuad_schema import _category_output_column, get_category_by_name, resolve_selected_categories
+    from .cuad_schema import get_category_names as get_category_names
+    from .cuad_schema import normalize_category_name as normalize_category_name
+    from .cuad_schema import validate_category_names as validate_category_names
+except ImportError:
+    from cuad_data import build_label_records, load_cuad_records, select_records
+    from cuad_data import load_cuad_data as load_cuad_data
+    from cuad_schema import CUAD_CATEGORIES as CUAD_CATEGORIES
+    from cuad_schema import DEFAULT_CUAD_CATEGORY_NAMES as DEFAULT_CUAD_CATEGORY_NAMES
+    from cuad_schema import _category_output_column, get_category_by_name, resolve_selected_categories
+    from cuad_schema import get_category_names as get_category_names
+    from cuad_schema import normalize_category_name as normalize_category_name
+    from cuad_schema import validate_category_names as validate_category_names
 
 # 0.15 is used in the Doc-ETL paper. It should be 0.5 for the actual benchmark.
 IOU_THRESH = 0.15
-
-
-def get_category_names() -> list[str]:
-    return list(DEFAULT_CUAD_CATEGORY_NAMES)
-
-
-def get_category_by_name(category_name: str) -> dict:
-    categories_by_name = {category["Category"]: category for category in CUAD_CATEGORIES}
-    try:
-        return categories_by_name[category_name]
-    except KeyError as exc:
-        raise ValueError(f"Unknown CUAD category: {category_name}") from exc
-
-
-def normalize_category_name(category_name: str) -> str:
-    normalized = category_name.strip()
-    normalized = normalized.replace(" For ", " for ")
-    normalized = normalized.replace(" Of ", " of ")
-    normalized = normalized.replace(" On ", " on ")
-    normalized = normalized.replace(" Or ", " or ")
-    normalized = normalized.replace(" To ", " to ")
-    normalized = normalized.replace("Ip", "IP")
-    return normalized
-
-
-def resolve_selected_categories(
-    selected_categories: list[str] | None = None,
-    difficulty_buckets: dict[str, list[str]] | None = None,
-) -> list[str]:
-    if selected_categories is not None:
-        resolved_categories = list(selected_categories)
-    elif difficulty_buckets is not None:
-        resolved_categories = []
-        for difficulty in ("easy", "medium", "hard"):
-            resolved_categories.extend(difficulty_buckets.get(difficulty, []))
-    else:
-        resolved_categories = get_category_names()
-
-    validate_category_names(resolved_categories)
-    return resolved_categories
-
-
-def validate_category_names(category_names: list[str]) -> None:
-    known_categories = set(get_category_names())
-    duplicates = sorted({name for name in category_names if category_names.count(name) > 1})
-    if duplicates:
-        raise ValueError(f"Duplicate CUAD categories configured: {duplicates}")
-
-    unknown_categories = [name for name in category_names if name not in known_categories]
-    if unknown_categories:
-        raise ValueError(f"Unknown CUAD categories configured: {unknown_categories}")
-
-
-def _category_output_column(category: dict) -> dict:
-    desc = (
-        f"Extract the text spans (if they exist) from the contract corresponding to: {category['Description']}. "
-        "If no spans exist, return an empty list. Quote text spans verbatim (do not summarize or paraphrase)."
-    )
-    return {"name": category["Category"], "type": list[str], "desc": desc}
-
-
-def _extract_answer_texts(row: dict) -> list[str]:
-    if isinstance(row["answers"], list):
-        return [ans["text"] for ans in row["answers"]] if row["answers"] else []
-    return row["answers"].get("text", [])
 
 
 def get_label_df(
@@ -338,61 +37,9 @@ def get_label_df(
     data_dir: str | None = None,
 ) -> pd.DataFrame:
     selected_categories = resolve_selected_categories(selected_categories)
-    selected_category_set = set(selected_categories)
-    dataset = load_cuad_data(split=split, data_dir=data_dir, dataset_mode=dataset_mode)
-
-    # get the set of unique contract titles; to ensure the order of the contracts is
-    # preserved, we use a list rather than using python's set()
-    contract_titles = []
-    for row in dataset:
-        if row["title"] not in contract_titles:
-            contract_titles.append(row["title"])
-
-    # shuffle the contracts for the given seed
-    rng = np.random.default_rng(seed=seed)
-    rng.shuffle(contract_titles)
-
-    # get the first num_contracts
-    contract_titles = contract_titles[:num_contracts]
-
-    # construct the dataset one contract at a time
-    final_label_dataset = []
-    for title in contract_titles:
-        # get the rows for this contract
-        contract_rows = [row for row in dataset if row["title"] == title]
-
-        # construct the contract; we get the contract_id and contract text from the first row
-        contract = {
-            "contract_id": contract_rows[0]["id"],
-            "title": title,
-            "contract": contract_rows[0]["context"],
-        }
-        if dataset_mode == "cuad-chunk":
-            contract.update(
-                {
-                    "dataset_mode": dataset_mode,
-                    "chunk_index": contract_rows[0].get("chunk_index"),
-                    "chunk_start": contract_rows[0].get("chunk_start"),
-                    "chunk_end": contract_rows[0].get("chunk_end"),
-                    "source_paragraph_index": contract_rows[0].get("source_paragraph_index"),
-                }
-            )
-
-        # add the labels
-        contract.update({category_name: [] for category_name in selected_categories})
-        for row in contract_rows:
-            category_name = row["id"].split("__")[-1].split("_")[0].strip()
-            category_name = normalize_category_name(category_name)
-            if category_name not in selected_category_set:
-                continue
-
-            answer_texts = _extract_answer_texts(row)
-            contract[category_name].extend(answer_texts)
-
-        # add the contract to the dataset
-        final_label_dataset.append(contract)
-
-    return pd.DataFrame(final_label_dataset)
+    records = load_cuad_records(split=split, data_dir=data_dir, dataset_mode=dataset_mode)
+    selected_records = select_records(records, num_contracts, seed)
+    return pd.DataFrame(build_label_records(selected_records, selected_categories, dataset_mode))
 
 
 #  Return the Jaccard similarity between two strings
@@ -508,45 +155,20 @@ class CUADDataset(pz.IterDataset):
         ]
         super().__init__(id="cuad", schema=input_cols)
 
-        # Convert the dataset into runnable rows. For cuad-chunk, each title is already a chunk-native unit.
-        dataset = load_cuad_data(split=split, data_dir=data_dir, dataset_mode=dataset_mode)
-        self.dataset = self._construct_dataset(dataset, num_contracts, seed)
+        records = load_cuad_records(split=split, data_dir=data_dir, dataset_mode=dataset_mode)
+        self.dataset = self._construct_dataset(records, num_contracts, seed)
 
-
-    def _construct_dataset(self, dataset, num_contracts, seed: int=42):
-        # get the set of unique contract titles; to ensure the order of the contracts is
-        # preserved, we use a list rather than using python's set()
-        contract_titles = []
-        for row in dataset:
-            if row["title"] not in contract_titles:
-                contract_titles.append(row["title"])
-
-        # shuffle the contracts for the given seed
-        rng = np.random.default_rng(seed=seed)
-        rng.shuffle(contract_titles)
-
-        # get the first num_contracts
-        contract_titles = contract_titles[:num_contracts]
-
-        # construct the dataset one contract at a time
-        new_dataset = []
-        for title in contract_titles:
-            # get the rows for this contract
-            contract_rows = [row for row in dataset if row["title"] == title]
-
-            # construct the contract; we get the contract_id and contract text from the first row
-            contract = {
-                "contract_id": contract_rows[0]["id"],
-                "title": title,
-                "contract": contract_rows[0]["context"],
+    def _construct_dataset(self, records, num_contracts, seed: int = 42):
+        return [
+            {
+                "contract_id": record["contract_id"],
+                "title": record["title"],
+                "contract": record["contract"],
                 "dataset_mode": self.dataset_mode,
-                "chunk_index": contract_rows[0].get("chunk_index"),
+                "chunk_index": record.get("chunk_index"),
             }
-
-            # add the rows to the dataset
-            new_dataset.append(contract)
-
-        return new_dataset
+            for record in select_records(records, num_contracts, seed)
+        ]
 
     def __len__(self):
         return self.num_contracts

@@ -7,18 +7,13 @@ output_dir: opt-profiling-data
 
 dataset:
   mode: cuad-chunk
-  data_dir: testdata/cuad-chunk
+  data_dir: testdata/cuad/chunks
 
 split: train
 num_contracts: 200  # chunk-native rows when dataset.mode is cuad-chunk
 seed: 42
 job_mode: grouped
 verbose: true
-
-models:
-  - openrouter/qwen/qwen3-8b
-  - openrouter/qwen/qwen3-14b
-  - openrouter/qwen/qwen3-32b
 
 categories:
   # If selected is omitted, the benchmark uses every category listed in the

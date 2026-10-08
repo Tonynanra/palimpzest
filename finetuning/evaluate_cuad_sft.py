@@ -16,13 +16,15 @@ from pathlib import Path
 from typing import Any
 
 try:
+    from .cuad_data import CuadJsonlDataset
     from .cuad_demo import evaluate_entry
     from .cuad_sft_data import _TextPromptModel, render_cuad_messages
-    from .train_cuad_sft import CuadJsonlDataset, _text_messages, apply_sft_chat_template
+    from .train_cuad_sft import _text_messages, apply_sft_chat_template
 except ImportError:
+    from cuad_data import CuadJsonlDataset
     from cuad_demo import evaluate_entry
     from cuad_sft_data import _TextPromptModel, render_cuad_messages
-    from train_cuad_sft import CuadJsonlDataset, _text_messages, apply_sft_chat_template
+    from train_cuad_sft import _text_messages, apply_sft_chat_template
 
 from palimpzest.constants import Cardinality
 from palimpzest.query.generators.generators import get_json_from_answer

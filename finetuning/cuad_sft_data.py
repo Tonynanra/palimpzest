@@ -19,31 +19,34 @@ from typing import Any, Iterable
 import numpy as np
 
 try:
-    from .cuad_data_loader import load_cuad_data
-    from .cuad_demo import (
+    from .cuad_data import DEFAULT_CHUNK_DATA_DIR as DEFAULT_CHUNK_DATA_DIR
+    from .cuad_data import DEFAULT_RAW_DATA_DIR as DEFAULT_RAW_DATA_DIR
+    from .cuad_data import DEFAULT_SFT_DATA_DIR as DEFAULT_OUTPUT_DIR
+    from .cuad_data import DEFAULT_SFT_TEST_DATA_DIR as DEFAULT_TEST_OUTPUT_DIR
+    from .cuad_data import REPO_ROOT as REPO_ROOT
+    from .cuad_data import build_label_records, iter_cuad_paragraphs, load_cuad_records
+    from .cuad_schema import (
         _category_output_column,
         get_category_by_name,
         get_category_names,
-        get_label_df,
     )
 except ImportError:
-    from cuad_data_loader import load_cuad_data
-    from cuad_demo import (
+    from cuad_data import DEFAULT_CHUNK_DATA_DIR as DEFAULT_CHUNK_DATA_DIR
+    from cuad_data import DEFAULT_RAW_DATA_DIR as DEFAULT_RAW_DATA_DIR
+    from cuad_data import DEFAULT_SFT_DATA_DIR as DEFAULT_OUTPUT_DIR
+    from cuad_data import DEFAULT_SFT_TEST_DATA_DIR as DEFAULT_TEST_OUTPUT_DIR
+    from cuad_data import REPO_ROOT as REPO_ROOT
+    from cuad_data import build_label_records, iter_cuad_paragraphs, load_cuad_records
+    from cuad_schema import (
         _category_output_column,
         get_category_by_name,
         get_category_names,
-        get_label_df,
     )
 
 from palimpzest.constants import Cardinality, PromptStrategy
 from palimpzest.core.elements.records import DataRecord
 from palimpzest.core.lib.schemas import create_schema_from_fields
 from palimpzest.prompts.prompt_factory import PromptFactory
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CHUNK_DATA_DIR = REPO_ROOT / "testdata" / "cuad-chunk"
-DEFAULT_RAW_DATA_DIR = REPO_ROOT / "testdata" / "cuad-data"
-DEFAULT_OUTPUT_DIR = REPO_ROOT / "finetuning" / "artifacts" / "cuad-sft"
 
 INPUT_FIELD = {
     "name": "contract",
@@ -75,7 +78,7 @@ class SFTDataConfig:
     chunk_data_dir: Path = DEFAULT_CHUNK_DATA_DIR
     raw_data_dir: Path = DEFAULT_RAW_DATA_DIR
     split: str = "train"
-    output_dir: Path = DEFAULT_OUTPUT_DIR
+    output_dir: Path | None = None
     seed: int = 42
     train_fraction: float = 0.9
     views_per_chunk: int = len(VIEW_SPECS)
@@ -83,6 +86,12 @@ class SFTDataConfig:
     def __post_init__(self) -> None:
         if self.split not in {"train", "test"}:
             raise ValueError(f"Unsupported CUAD split: {self.split}")
+        if self.output_dir is None:
+            object.__setattr__(
+                self,
+                "output_dir",
+                DEFAULT_OUTPUT_DIR if self.split == "train" else DEFAULT_TEST_OUTPUT_DIR,
+            )
         if not 0.0 < self.train_fraction < 1.0:
             raise ValueError("train_fraction must be strictly between 0 and 1")
         if self.views_per_chunk != len(VIEW_SPECS):
@@ -109,11 +118,13 @@ def _normalize_source_text(text: str) -> str:
 
 def _source_hash_by_title(raw_data_dir: Path, split: str) -> dict[str, str]:
     """Map each original contract title to a stable full-source content hash."""
-    raw_rows = load_cuad_data(split=split, data_dir=str(raw_data_dir), dataset_mode="cuad-data")
     source_hashes: dict[str, str] = {}
-    for row in raw_rows:
-        title = row["title"]
-        digest = _stable_hash(_normalize_source_text(row["context"]))
+    for title, paragraph in iter_cuad_paragraphs(
+        split=split,
+        data_dir=str(raw_data_dir),
+        dataset_mode="cuad-data",
+    ):
+        digest = _stable_hash(_normalize_source_text(paragraph["context"].strip()))
         previous = source_hashes.setdefault(title, digest)
         if previous != digest:
             raise ValueError(f"Source title {title!r} maps to multiple full contract contents")
@@ -221,62 +232,38 @@ def _split_source_hashes(
     return set(sources[:train_count]), set(sources[train_count:])
 
 
-def _metadata_for_title(rows: list[dict[str, Any]], title: str) -> dict[str, Any]:
-    matching = [row for row in rows if row["title"] == title]
-    if not matching:
-        raise KeyError(f"No CUAD rows found for title {title!r}")
-    first = matching[0]
-    return {
-        "contract_id": first["id"],
-        "title": title,
-        "contract": first["context"],
-        "dataset_mode": first.get("dataset_mode"),
-        "chunk_index": first.get("chunk_index"),
-        "chunk_start": first.get("chunk_start"),
-        "chunk_end": first.get("chunk_end"),
-        "source_paragraph_index": first.get("source_paragraph_index"),
-    }
-
-
 def build_sft_examples(config: SFTDataConfig) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Build train/dev SFT rows and a reproducibility manifest."""
     categories = get_category_names()
-    chunk_rows = load_cuad_data(
+    chunk_records = load_cuad_records(
         split=config.split,
         data_dir=str(config.chunk_data_dir),
         dataset_mode="cuad-chunk",
     )
-    titles = sorted({row["title"] for row in chunk_rows})
+    titles = sorted(chunk_records)
     if not titles:
         raise ValueError("No CUAD chunk rows were loaded")
 
-    labels_df = get_label_df(
-        num_contracts=len(titles),
-        seed=config.seed,
-        selected_categories=categories,
-        split=config.split,
-        dataset_mode="cuad-chunk",
-        data_dir=str(config.chunk_data_dir),
+    label_records = build_label_records(
+        list(chunk_records.values()),
+        categories,
+        "cuad-chunk",
     )
     labels_by_title = {
         row["title"]: {
             category: _coerce_answers(row.get(category, []))
             for category in categories
         }
-        for _, row in labels_df.iterrows()
+        for row in label_records
     }
 
     source_hashes_by_original_title = _source_hash_by_title(config.raw_data_dir, config.split)
-    title_to_metadata = {
-        title: _metadata_for_title(chunk_rows, title)
-        for title in titles
-    }
     title_to_source_hash: dict[str, str] = {}
     for title in titles:
         original_title = _base_source_title(title)
         title_to_source_hash[title] = source_hashes_by_original_title.get(
             original_title,
-            _stable_hash(_normalize_source_text(title_to_metadata[title]["contract"])),
+            _stable_hash(_normalize_source_text(chunk_records[title]["contract"])),
         )
 
     source_hashes = set(title_to_source_hash.values())
@@ -298,7 +285,7 @@ def build_sft_examples(config: SFTDataConfig) -> tuple[list[dict[str, Any]], dic
     for title in titles:
         source_hash = title_to_source_hash[title]
         dataset_split = "test" if config.split == "test" else "train" if source_hash in train_sources else "dev"
-        metadata = title_to_metadata[title]
+        metadata = chunk_records[title]
         labels = labels_by_title.get(title, {category: [] for category in categories})
         title_seed = int(source_hash[:16], 16) ^ config.seed
         rng = np.random.default_rng(title_seed)
@@ -379,15 +366,23 @@ def write_sft_artifacts(
         json.dump(manifest, handle, ensure_ascii=False, indent=2)
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build randomized CUAD Qwen SFT data")
     parser.add_argument("--chunk-data-dir", type=Path, default=DEFAULT_CHUNK_DATA_DIR)
     parser.add_argument("--raw-data-dir", type=Path, default=DEFAULT_RAW_DATA_DIR)
     parser.add_argument("--split", choices=["train", "test"], default="train")
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="JSONL and manifest directory (default: testdata/cuad/sft/train-dev for train, testdata/cuad/sft/test for test)",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--train-fraction", type=float, default=0.9)
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.output_dir is None:
+        args.output_dir = DEFAULT_OUTPUT_DIR if args.split == "train" else DEFAULT_TEST_OUTPUT_DIR
+    return args
 
 
 def main() -> None:

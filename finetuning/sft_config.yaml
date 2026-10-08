@@ -8,7 +8,7 @@ model:
   id: Qwen/Qwen3.5-4B
 
 data:
-  dir: finetuning/artifacts/cuad-sft
+  dir: testdata/cuad/sft/train-dev
 
 training:
   max_seq_length: 36864
