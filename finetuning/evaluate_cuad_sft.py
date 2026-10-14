@@ -18,11 +18,13 @@ from typing import Any
 try:
     from .cuad_data import CuadJsonlDataset
     from .cuad_demo import evaluate_entry
+    from .cuad_sft_config import load_run_config
     from .cuad_sft_data import _TextPromptModel, render_cuad_messages
     from .train_cuad_sft import _text_messages, apply_sft_chat_template
 except ImportError:
     from cuad_data import CuadJsonlDataset
     from cuad_demo import evaluate_entry
+    from cuad_sft_config import load_run_config
     from cuad_sft_data import _TextPromptModel, render_cuad_messages
     from train_cuad_sft import _text_messages, apply_sft_chat_template
 
@@ -509,10 +511,10 @@ def _run_comparison(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Compare vanilla and SFT Qwen3.5 CUAD performance")
-    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser = argparse.ArgumentParser(description="Compare vanilla and SFT Qwen CUAD performance")
+    parser.add_argument("--run-dir", type=Path, required=True)
+    parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--data-dir", type=Path, required=True)
-    parser.add_argument("--model-id", default="Qwen/Qwen3.5-4B")
     parser.add_argument("--mode", choices=["all", "singleton", "grouped", "randomized", "canonical"], default="all")
     parser.add_argument("--split", choices=["all", "train", "dev", "test"], default="all")
     parser.add_argument("--max-new-tokens", type=_positive_int, default=8192)
@@ -523,14 +525,20 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def parse_args() -> argparse.Namespace:
-    return build_parser().parse_args()
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    args = build_parser().parse_args(argv)
+    config = load_run_config(args.run_dir)
+    args.model_id = config.model_id
+    args.checkpoint = args.checkpoint or args.run_dir / "adapter"
+    args.output = args.output or args.run_dir / "comparison.json"
+    args.flash_attention = config.flash_attention and not args.no_flash_attention
+    return args
 
 
 def main() -> None:
     args = parse_args()
     selected_rows = _prepare_rows(_load_rows(args.data_dir, args.split), args.mode, args.limit)
-    output_path = args.output or (args.checkpoint.parent / "comparison.json")
+    output_path = args.output
     timing_log_path = output_path.parent / "inference_walltime.jsonl"
     timing_logger = InferenceWalltimeLogger(timing_log_path)
     try:
@@ -540,7 +548,7 @@ def main() -> None:
             selected_rows,
             args.mode,
             args.max_new_tokens,
-            not args.no_flash_attention,
+            args.flash_attention,
             timing_logger=timing_logger,
             timing_log_every=args.timing_log_every,
         )

@@ -1,7 +1,7 @@
-# CUAD Qwen3.5 SFT
+# CUAD Qwen SFT
 
 This document describes the current CUAD supervised fine-tuning workflow in this repository.
-The implementation trains a Qwen3.5-4B LoRA/QLoRA adapter on the local CUAD chunk dataset and evaluates it through the existing Palimpzest JSON extraction pipeline.
+The implementation trains a Qwen3.5-4B, Qwen3.5-9B, or Qwen3.8-27B LoRA/QLoRA adapter on the local CUAD chunk dataset and evaluates it through the existing Palimpzest JSON extraction pipeline.
 
 ## Workflow
 
@@ -16,9 +16,10 @@ testdata/cuad/sft/train-dev/{train,dev}.jsonl
         │
         ▼
 train_cuad_sft.py
-        │  Qwen3.5 + PEFT LoRA/QLoRA
+        │  selected Qwen model + PEFT LoRA/QLoRA
         ▼
-finetuning/artifacts/cuad-sft-run/adapter
+finetuning/artifacts/cuad-sft-runs/{RUN}/
+        │  config_snapshot.yaml, adapter/, checkpoint-*/
         │
         ├── evaluate_cuad_sft.py
         ├── merge_cuad_sft_adapter.py
@@ -41,8 +42,9 @@ The assistant completion ends with `---`, matching the existing Palimpzest conve
 | [cuad_schema.py](cuad_schema.py) | CUAD categories, normalization, validation, and output-field descriptions. |
 | [setup_cuad_data.py](setup_cuad_data.py) | Downloads raw CUAD data without depending on the historical research directory. |
 | [cuad_sft_data.py](cuad_sft_data.py) | Builds deterministic train/dev and isolated test JSONL examples. |
-| [sft_config.yaml](sft_config.yaml) | Default Qwen3.5 training configuration. |
-| [train_cuad_sft.py](train_cuad_sft.py) | Loads Qwen3.5, attaches LoRA/QLoRA, masks prompt tokens, and trains. |
+| [sft_config.yaml](sft_config.yaml) | Default Qwen training configuration. |
+| [cuad_sft_config.py](cuad_sft_config.py) | Shared model selection, configuration parsing, and run-root snapshots. |
+| [train_cuad_sft.py](train_cuad_sft.py) | Loads the selected model, attaches LoRA/QLoRA, masks prompt tokens, and trains. |
 | [evaluate_cuad_sft.py](evaluate_cuad_sft.py) | Generates predictions and reports CUAD extraction metrics. |
 | [merge_cuad_sft_adapter.py](merge_cuad_sft_adapter.py) | Merges a PEFT adapter into a standalone checkpoint. |
 | [serve_cuad_sft.py](serve_cuad_sft.py) | Launches adapter or merged-model vLLM serving. |
@@ -118,8 +120,7 @@ at these locations, building only missing bundles.
 The checked-in [sft_config.yaml](sft_config.yaml) currently contains:
 
 ```yaml
-model:
-  id: Qwen/Qwen3.5-4B
+model: Qwen/Qwen3.5-4B
 
 data:
   dir: testdata/cuad/sft/train-dev
@@ -142,6 +143,8 @@ training:
 
 The training artifact directory is owned by `train_cuad_sft.py`, not this YAML file. It defaults to `finetuning/artifacts/cuad-sft-run` and can be changed with `--output-dir`.
 
+The supported `model` values are `Qwen/Qwen3.5-4B`, `Qwen/Qwen3.5-9B`, and `Qwen/Qwen3.8-27B`. Training's optional `--model-id` overrides this YAML value before model validation. Downstream commands read the effective selection from the saved run, so editing the input YAML after training does not change inference's model.
+
 The H200 workflow uses `qlora: false`, FlashAttention-3, and one visible CUDA device. The base model is loaded in BF16 and only the LoRA adapter parameters are trainable. When `training.flash_attention` is true, the trainer and evaluator request `flash_attention_3` when `flash_attn_interface` is installed and warn before falling back to SDPA when it is unavailable.
 
 The trainer:
@@ -159,7 +162,9 @@ The trainer:
 
 ```bash
 ./.venv/bin/python finetuning/train_cuad_sft.py \
-  --config finetuning/sft_config.yaml
+  --config finetuning/sft_config.yaml \
+  --model-id Qwen/Qwen3.5-9B \
+  --output-dir finetuning/artifacts/cuad-sft-runs/demo
 ```
 
 For a one-step smoke run on the same training path:
@@ -175,6 +180,7 @@ For a one-step smoke run on the same training path:
 | Option | Default | Meaning |
 |---|---|---|
 | `--config` | `finetuning/sft_config.yaml` | YAML training configuration. |
+| `--model-id` | unset | Override YAML `model` with one of the three supported full model IDs. |
 | `--resume-from-checkpoint` | unset | Hugging Face Trainer checkpoint to resume. |
 | `--max-steps` | unset | Optional optimizer-step cap for a smoke run. |
 | `--eval-limit` | unset | Optional limit on dev rows evaluated during training. |
@@ -182,6 +188,7 @@ For a one-step smoke run on the same training path:
 | `--log-level` | `INFO` | Python logging level. |
 
 The trainer writes checkpoints, `adapter/`, tokenizer files, and `training_manifest.json` under the selected output directory.
+Before loading weights it writes one `config_snapshot.yaml` at that directory's root, containing the effective model, resolved data/training settings, and runtime controls (`output_dir`, `max_steps`, `eval_limit`, and `resume_from_checkpoint`). No snapshot copies are created inside checkpoints, adapters, or merged exports. Reusing a run directory or resuming a checkpoint with a different saved model is rejected before the snapshot is overwritten. Downstream commands require the snapshot; legacy runs are outside this workflow.
 It also writes `training_walltime.jsonl` with `train_start`, `checkpoint`, and `train_end` events.
 Each checkpoint event records the checkpoint path, global step, epoch, UTC timestamp, and elapsed training seconds.
 
@@ -189,12 +196,11 @@ Each checkpoint event records the checkpoint path, global step, epoch, UTC times
 
 ```bash
 ./.venv/bin/python finetuning/evaluate_cuad_sft.py \
-  --checkpoint finetuning/artifacts/cuad-sft-run/adapter \
+  --run-dir finetuning/artifacts/cuad-sft-runs/demo \
   --data-dir testdata/cuad/sft/test \
   --split test \
-  --model-id Qwen/Qwen3.5-4B \
   --mode all \
-  --output finetuning/artifacts/cuad-sft-run/comparison.json
+  --output finetuning/artifacts/cuad-sft-runs/demo/evaluation-test/comparison.json
 ```
 
 Every invocation compares the vanilla base model against the supplied SFT checkpoint. There is no comparison flag and no plot-directory flag.
@@ -202,16 +208,18 @@ The output directory contains `vanilla.json`, `sft.json`, `comparison.json`, and
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--checkpoint` | required | Adapter directory or merged model directory. |
+| `--run-dir` | required | Run root containing `config_snapshot.yaml`. |
+| `--checkpoint` | run root/`adapter` | Adapter directory or merged model directory. |
 | `--data-dir` | required | Directory containing `train.jsonl`, `dev.jsonl`, or `test.jsonl`. |
-| `--model-id` | `Qwen/Qwen3.5-4B` | Base model used with an adapter. |
 | `--mode` | `all` | `all`, `singleton`, `grouped`, `randomized`, or `canonical`. |
 | `--split` | `all` | Read all JSONL files or only `train`, `dev`, or `test`. |
 | `--max-new-tokens` | `8192` | Generation limit. |
 | `--limit` | unset | Optional row limit for a smoke evaluation. |
-| `--output` | checkpoint parent/`comparison.json` | Comparison JSON output path. The vanilla and SFT reports are written beside it. |
+| `--output` | run root/`comparison.json` | Comparison JSON output path. The vanilla and SFT reports are written beside it. |
 | `--timing-log-every` | `10` | Log inference progress after every N rows for each model. |
 | `--no-flash-attention` | false | Force the non-FlashAttention path. |
+
+Model identity and the default FlashAttention setting come from the run snapshot. The evaluation data directory remains explicit so training data cannot be selected accidentally.
 
 Reported metrics include:
 
@@ -240,41 +248,42 @@ Merge an adapter into a standalone checkpoint:
 
 ```bash
 ./.venv/bin/python finetuning/merge_cuad_sft_adapter.py \
-  --model-id Qwen/Qwen3.5-4B \
-  --adapter-dir finetuning/artifacts/cuad-sft-run/adapter \
-  --output-dir finetuning/artifacts/cuad-sft-run/merged
+  --run-dir finetuning/artifacts/cuad-sft-runs/demo
 ```
+
+The default adapter and merged paths are `{RUN}/adapter` and `{RUN}/merged`; `--adapter-dir` and `--output-dir` retain explicit overrides.
 
 Serve the adapter directly through vLLM:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 ./.venv/bin/python finetuning/serve_cuad_sft.py \
-  --adapter-dir finetuning/artifacts/cuad-sft-run/adapter \
-  --served-model-name cuad-qwen35-4b
+  --run-dir finetuning/artifacts/cuad-sft-runs/demo
 ```
 
 Serve the merged fallback:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 ./.venv/bin/python finetuning/serve_cuad_sft.py \
-  --merged-dir finetuning/artifacts/cuad-sft-run/merged \
-  --served-model-name cuad-qwen35-4b
+  --run-dir finetuning/artifacts/cuad-sft-runs/demo \
+  --merged-dir finetuning/artifacts/cuad-sft-runs/demo/merged
 ```
 
 Common serving options:
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--model-id` | `Qwen/Qwen3.5-4B` | Base model for direct adapter serving. |
-| `--adapter-dir` | unset | PEFT adapter path. Mutually exclusive with `--merged-dir`. |
+| `--run-dir` | required | Run root containing `config_snapshot.yaml`. |
+| `--adapter-dir` | run root/`adapter` | PEFT adapter path. Mutually exclusive with `--merged-dir`. |
 | `--merged-dir` | unset | Standalone merged checkpoint path. |
-| `--adapter-name` | `cuad-qwen35-4b` | vLLM LoRA adapter name. |
-| `--served-model-name` | `cuad-qwen35-4b` | Model ID exposed by the OpenAI-compatible API. |
+| `--adapter-name` | derived from saved model | vLLM LoRA adapter name, e.g. `cuad-qwen35-9b`. |
+| `--served-model-name` | derived from saved model | Model ID exposed by the OpenAI-compatible API. |
 | `--host` | `0.0.0.0` | Server bind address. |
 | `--port` | `8000` | Server port. |
 | `--max-model-len` | `32768` | vLLM context limit. |
-| `--max-lora-rank` | `32` | Maximum served adapter rank. |
+| `--max-lora-rank` | saved `training.lora_rank` | Maximum served adapter rank. |
 | `--dry-run` | false | Print the vLLM command without launching it. |
+
+Serving sets `enable_thinking=false` through vLLM's default chat-template arguments, matching training and HF evaluation. The context limit remains explicit and may need increasing for longer prompts plus generated tokens.
 
 ## Palimpzest benchmark integration
 
@@ -317,11 +326,11 @@ UV_CACHE_DIR=/tmp/palimpzest-uv-cache uv sync --all-extras
 
 The locked H200 stack uses Python 3.12, CUDA 13.0 Torch 2.13, Transformers 5.17, vLLM 0.30, sentence-transformers 6.1, FlashAttention-3 from the Hopper subdirectory of Dao-AILab/flash-attention, flash-linear-attention 0.5.2 with CUDA support, and causal-conv1d 1.7. FlashAttention-3 and causal-conv1d are built without isolation after Torch is installed.
 
-## H200 Slurm validation
+## H200 Slurm workflow
 
 The resource and storage choices use the repository `.venv` and durable NFS-backed paths.
 
-[run_h200_gpu_validation.slurm](run_h200_gpu_validation.slurm) runs the GPU-only validation workflow on one node:
+[run_h200_cuad_sft.slurm](run_h200_cuad_sft.slurm) runs training and isolated test evaluation on one H200. It forwards training CLI arguments, then supplies `--model-id Qwen/Qwen3.8-27B` and its own `--output-dir` last. The script always selects the 27B model, and all artifacts stay under `finetuning/artifacts/cuad-sft-runs/{SLURM_JOB_ID}`.
 
 - Account: `quanta`
 - Partition: `quanta-h200`
@@ -329,16 +338,16 @@ The resource and storage choices use the repository `.venv` and durable NFS-back
 - Node: `quanta-h200-1`
 - Constraint: `nvidia_h200`
 - CPUs: 16
-- RAM: 32 GB
+- RAM: 64 GB by default; choose resources appropriate to the model
 - GPUs: 1
-- Time limit: short validation allocation
+- Time limit: two days
 - Environment: repository `.venv`
-- Validation: H200 identity, FA3 `sm_90a`, BF16 FA3/SDPA numerics, Qwen forward/backward, one-step LoRA SFT, dev/test evaluation, and local vLLM request
+- Evaluation: the isolated test holdout, with output under `{RUN}/evaluation-test/`
 
-Submit it from any Slurm node with access to the checkout. Durable stdout, stderr, reports, and artifacts are written under `finetuning/artifacts/h200-gpu-validation/`; only disposable temporary files use node-local storage.
+Submit it from any Slurm node with access to the checkout. Evaluation reads the script's effective model from `{RUN}/config_snapshot.yaml`; no separate evaluation model ID is supplied.
 
 From the repository root on any Slurm node:
 
 ```bash
-sbatch finetuning/run_h200_gpu_validation.slurm
+sbatch finetuning/run_h200_cuad_sft.slurm
 ```

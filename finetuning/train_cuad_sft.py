@@ -1,4 +1,4 @@
-"""Single-GPU LoRA SFT trainer for Qwen3.5 on CUAD."""
+"""Single-GPU LoRA SFT trainer for Qwen on CUAD."""
 
 from __future__ import annotations
 
@@ -8,22 +8,27 @@ import json
 import logging
 import math
 import time
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import yaml
-
 try:
     from .cuad_data import CuadJsonlDataset as CuadJsonlDataset
+    from .cuad_sft_config import DEFAULT_MAX_SEQ_LENGTH as DEFAULT_MAX_SEQ_LENGTH
+    from .cuad_sft_config import DEFAULT_MODEL_ID as DEFAULT_MODEL_ID
+    from .cuad_sft_config import DEFAULT_OUTPUT_DIR as DEFAULT_OUTPUT_DIR
+    from .cuad_sft_config import SUPPORTED_MODEL_IDS, load_training_config, save_config_snapshot
+    from .cuad_sft_config import TrainConfig as TrainConfig
 except ImportError:
     from cuad_data import CuadJsonlDataset as CuadJsonlDataset
+    from cuad_sft_config import DEFAULT_MAX_SEQ_LENGTH as DEFAULT_MAX_SEQ_LENGTH
+    from cuad_sft_config import DEFAULT_MODEL_ID as DEFAULT_MODEL_ID
+    from cuad_sft_config import DEFAULT_OUTPUT_DIR as DEFAULT_OUTPUT_DIR
+    from cuad_sft_config import SUPPORTED_MODEL_IDS, load_training_config, save_config_snapshot
+    from cuad_sft_config import TrainConfig as TrainConfig
 
 LOGGER = logging.getLogger("cuad-sft")
-DEFAULT_MODEL_ID = "Qwen/Qwen3.5-4B"
-DEFAULT_MAX_SEQ_LENGTH = 32768
-DEFAULT_OUTPUT_DIR = Path("finetuning/artifacts/cuad-sft-run")
 
 # Qwen3.5 dense text layers contain both the Qwen attention projections and
 # Gated DeltaNet projections.  Resolve only suffixes that are actually present
@@ -42,74 +47,6 @@ TARGET_MODULE_SUFFIXES = (
     "up_proj",
     "down_proj",
 )
-
-
-@dataclass(frozen=True)
-class TrainConfig:
-    model_id: str = DEFAULT_MODEL_ID
-    data_dir: Path = Path("testdata/cuad/sft/train-dev")
-    output_dir: Path = DEFAULT_OUTPUT_DIR
-    max_seq_length: int = DEFAULT_MAX_SEQ_LENGTH
-    per_device_train_batch_size: int = 1
-    per_device_eval_batch_size: int = 1
-    gradient_accumulation_steps: int = 4
-    num_train_epochs: float = 3.0
-    learning_rate: float = 1e-4
-    warmup_ratio: float = 0.03
-    weight_decay: float = 0.0
-    lora_rank: int = 32
-    lora_alpha: int = 64
-    lora_dropout: float = 0.05
-    seed: int = 42
-    logging_steps: int = 1
-    save_total_limit: int = 3
-    qlora: bool = False
-    gradient_checkpointing: bool = True
-    flash_attention: bool = True
-
-    @classmethod
-    def from_mapping(cls, mapping: dict[str, Any]) -> TrainConfig:
-        model = mapping.get("model", {})
-        data = mapping.get("data", {})
-        training = mapping.get("training", {})
-        values = {
-            "model_id": model.get("id", mapping.get("model_id", cls.model_id)),
-            "data_dir": Path(data.get("dir", mapping.get("data_dir", cls.data_dir))),
-            "max_seq_length": int(training.get("max_seq_length", cls.max_seq_length)),
-            "per_device_train_batch_size": int(training.get("per_device_train_batch_size", cls.per_device_train_batch_size)),
-            "per_device_eval_batch_size": int(training.get("per_device_eval_batch_size", cls.per_device_eval_batch_size)),
-            "gradient_accumulation_steps": int(training.get("gradient_accumulation_steps", cls.gradient_accumulation_steps)),
-            "num_train_epochs": float(training.get("num_train_epochs", cls.num_train_epochs)),
-            "learning_rate": float(training.get("learning_rate", cls.learning_rate)),
-            "warmup_ratio": float(training.get("warmup_ratio", cls.warmup_ratio)),
-            "weight_decay": float(training.get("weight_decay", cls.weight_decay)),
-            "lora_rank": int(training.get("lora_rank", cls.lora_rank)),
-            "lora_alpha": int(training.get("lora_alpha", cls.lora_alpha)),
-            "lora_dropout": float(training.get("lora_dropout", cls.lora_dropout)),
-            "seed": int(training.get("seed", cls.seed)),
-            "logging_steps": int(training.get("logging_steps", cls.logging_steps)),
-            "save_total_limit": int(training.get("save_total_limit", cls.save_total_limit)),
-            "qlora": bool(training.get("qlora", cls.qlora)),
-            "gradient_checkpointing": bool(training.get("gradient_checkpointing", cls.gradient_checkpointing)),
-            "flash_attention": bool(training.get("flash_attention", cls.flash_attention)),
-        }
-        config = cls(**values)
-        config.validate()
-        return config
-
-    def validate(self) -> None:
-        if self.max_seq_length <= 0:
-            raise ValueError("max_seq_length must be positive")
-        if self.per_device_train_batch_size != 1 or self.per_device_eval_batch_size != 1:
-            raise ValueError("The CUAD SFT implementation is configured for batch size 1 on one GPU")
-        if self.gradient_accumulation_steps <= 0:
-            raise ValueError("gradient_accumulation_steps must be positive")
-        if self.num_train_epochs <= 0 or self.learning_rate <= 0:
-            raise ValueError("num_train_epochs and learning_rate must be positive")
-        if self.lora_rank <= 0 or self.lora_alpha <= 0:
-            raise ValueError("LoRA rank and alpha must be positive")
-        if not 0.0 <= self.lora_dropout < 1.0:
-            raise ValueError("lora_dropout must be in [0, 1)")
 
 
 def apply_sft_chat_template(tokenizer: Any, messages: list[dict[str, str]], **kwargs: Any) -> Any:
@@ -313,9 +250,8 @@ def resolve_lora_targets(model: Any) -> list[str]:
     return targets
 
 
-def _load_config(path: Path) -> TrainConfig:
-    with path.open(encoding="utf-8") as handle:
-        return TrainConfig.from_mapping(yaml.safe_load(handle) or {})
+def _load_config(path: Path, *, model_id: str | None = None) -> TrainConfig:
+    return load_training_config(path, model_id=model_id)
 
 
 def _model_kwargs(torch_module: Any, use_flash_attention: bool) -> dict[str, Any]:
@@ -336,7 +272,7 @@ def _load_model_and_tokenizer(config: TrainConfig) -> tuple[Any, Any, list[str]]
     from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
     if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required for Qwen3.5 CUAD SFT")
+        raise RuntimeError("CUDA is required for Qwen CUAD SFT")
     if torch.cuda.device_count() != 1:
         raise RuntimeError(
             f"This entrypoint is single-GPU by design; detected {torch.cuda.device_count()} GPUs"
@@ -396,6 +332,12 @@ def train(
         raise ValueError("max_steps must be positive")
     if eval_limit is not None and eval_limit <= 0:
         raise ValueError("eval_limit must be positive")
+    save_config_snapshot(
+        config,
+        max_steps=max_steps,
+        eval_limit=eval_limit,
+        resume_from_checkpoint=resume_from_checkpoint,
+    )
     set_seed(config.seed)
     train_dataset = CuadJsonlDataset(config.data_dir / "train.jsonl")
     eval_dataset = CuadJsonlDataset(config.data_dir / "dev.jsonl", limit=eval_limit)
@@ -487,8 +429,9 @@ def _positive_int(value: str) -> int:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train a Qwen3.5 CUAD LoRA adapter")
+    parser = argparse.ArgumentParser(description="Train a Qwen CUAD LoRA adapter")
     parser.add_argument("--config", type=Path, default=Path("finetuning/sft_config.yaml"))
+    parser.add_argument("--model-id", choices=SUPPORTED_MODEL_IDS, default=None, help="Override the YAML model selection.")
     parser.add_argument("--resume-from-checkpoint", default=None)
     parser.add_argument(
         "--max-steps",
@@ -515,7 +458,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     logging.basicConfig(level=getattr(logging, args.log_level.upper()))
-    config = _load_config(args.config)
+    config = _load_config(args.config, model_id=args.model_id)
     config = replace(config, output_dir=args.output_dir)
     adapter_dir = train(
         config,

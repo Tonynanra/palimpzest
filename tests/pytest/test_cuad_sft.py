@@ -138,7 +138,7 @@ def test_training_cli_smoke_controls_and_output_default():
     explicit = train_cuad_sft.parse_args(["--output-dir", "/tmp/cuad-smoke"])
     assert explicit.output_dir == Path("/tmp/cuad-smoke")
 
-    config = TrainConfig.from_mapping({})
+    config = TrainConfig.from_mapping({"model": "Qwen/Qwen3.5-4B"})
     assert config.output_dir == DEFAULT_OUTPUT_DIR
 
 
@@ -152,9 +152,9 @@ def test_evaluator_cli_rejects_non_positive_smoke_values():
     parser = evaluate_cuad_sft.build_parser()
 
     with pytest.raises(SystemExit):
-        parser.parse_args(["--checkpoint", "checkpoint", "--data-dir", "data", "--limit", "0"])
+        parser.parse_args(["--run-dir", "run", "--checkpoint", "checkpoint", "--data-dir", "data", "--limit", "0"])
     with pytest.raises(SystemExit):
-        parser.parse_args(["--checkpoint", "checkpoint", "--data-dir", "data", "--max-new-tokens", "0"])
+        parser.parse_args(["--run-dir", "run", "--checkpoint", "checkpoint", "--data-dir", "data", "--max-new-tokens", "0"])
 
 
 def test_training_passes_smoke_limits_to_trainer(monkeypatch, tmp_path):

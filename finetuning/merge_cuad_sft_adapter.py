@@ -1,9 +1,14 @@
-"""Merge a CUAD PEFT adapter into a standalone Qwen3.5 text checkpoint."""
+"""Merge a CUAD PEFT adapter into a standalone Qwen text checkpoint."""
 
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
+
+try:
+    from .cuad_sft_config import load_run_config
+except ImportError:
+    from cuad_sft_config import load_run_config
 
 
 def merge_adapter(model_id: str, adapter_dir: Path, output_dir: Path) -> Path:
@@ -25,12 +30,25 @@ def merge_adapter(model_id: str, adapter_dir: Path, output_dir: Path) -> Path:
     return output_dir
 
 
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Merge a CUAD Qwen LoRA adapter")
+    parser.add_argument("--run-dir", type=Path, required=True)
+    parser.add_argument("--adapter-dir", type=Path, default=None)
+    parser.add_argument("--output-dir", type=Path, default=None)
+    return parser
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    args = build_parser().parse_args(argv)
+    config = load_run_config(args.run_dir)
+    args.model_id = config.model_id
+    args.adapter_dir = args.adapter_dir or args.run_dir / "adapter"
+    args.output_dir = args.output_dir or args.run_dir / "merged"
+    return args
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Merge a CUAD Qwen3.5 LoRA adapter")
-    parser.add_argument("--model-id", default="Qwen/Qwen3.5-4B")
-    parser.add_argument("--adapter-dir", type=Path, required=True)
-    parser.add_argument("--output-dir", type=Path, required=True)
-    args = parser.parse_args()
+    args = parse_args()
     print(merge_adapter(args.model_id, args.adapter_dir, args.output_dir))
 
 

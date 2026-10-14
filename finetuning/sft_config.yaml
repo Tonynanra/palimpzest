@@ -1,11 +1,11 @@
-# Qwen3.5-4B CUAD full-BF16 LoRA SFT configuration for one NVIDIA GH200.
+# Qwen CUAD BF16 LoRA SFT configuration for one GPU.
+# Supported models: Qwen/Qwen3.5-4B, Qwen/Qwen3.5-9B, Qwen/Qwen3.8-27B.
 # Build data first:
 #   python finetuning/cuad_sft_data.py
 # Train:
 #   python finetuning/train_cuad_sft.py --config finetuning/sft_config.yaml
 
-model:
-  id: Qwen/Qwen3.5-4B
+model: Qwen/Qwen3.5-4B
 
 data:
   dir: testdata/cuad/sft/train-dev
