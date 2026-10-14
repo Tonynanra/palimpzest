@@ -18,7 +18,7 @@ def _minimal_config_yaml(extra: str = "") -> str:
     return f"""
 dataset:
   mode: cuad-chunk
-  data_dir: testdata/cuad-chunk
+  data_dir: testdata/cuad/chunks
 categories:
   selected:
     - Document Name
@@ -66,21 +66,26 @@ def test_resolve_selected_categories_from_manual_buckets():
 
 
 def test_get_label_df_selected_categories_ignores_inactive_rows(monkeypatch):
-    rows = [
-        {
-            "id": "contract-1__Document Name_0",
+    records = {
+        "Contract A": {
+            "contract_id": "contract-1__Document Name_0",
             "title": "Contract A",
-            "context": "Contract A text",
-            "answers": [{"text": "Contract A"}],
+            "contract": "Contract A text",
+            "qas": [
+                {
+                    "id": "contract-1__Document Name_0",
+                    "question": "What is the document name?",
+                    "answers": [{"text": "Contract A"}],
+                },
+                {
+                    "id": "contract-1__Parties_0",
+                    "question": "Who are the parties?",
+                    "answers": [{"text": "Acme"}],
+                },
+            ],
         },
-        {
-            "id": "contract-1__Parties_0",
-            "title": "Contract A",
-            "context": "Contract A text",
-            "answers": [{"text": "Acme"}],
-        },
-    ]
-    monkeypatch.setattr(cuad_demo, "load_cuad_data", lambda split, data_dir=None, dataset_mode="cuad-data": rows)
+    }
+    monkeypatch.setattr(cuad_demo, "load_cuad_records", lambda split, data_dir=None, dataset_mode="cuad-data": records)
 
     label_df = cuad_demo.get_label_df(num_contracts=1, seed=0, selected_categories=["Document Name"])
 
@@ -89,34 +94,48 @@ def test_get_label_df_selected_categories_ignores_inactive_rows(monkeypatch):
 
 
 def test_get_label_df_chunk_native_rows_preserve_chunk_metadata(monkeypatch):
-    rows = [
-        {
-            "id": "contract-1__Document Name_chunk_0",
+    records = {
+        "Contract A [p0-chunk0]": {
+            "contract_id": "contract-1__Document Name_chunk_0",
             "title": "Contract A [p0-chunk0]",
-            "context": "Contract A chunk",
-            "answers": [{"text": "Contract A"}],
+            "contract": "Contract A chunk",
+            "dataset_mode": "cuad-chunk",
             "chunk_index": 0,
             "chunk_start": 0,
             "chunk_end": 16,
             "source_paragraph_index": 0,
+            "qas": [
+                {
+                    "id": "contract-1__Document Name_chunk_0",
+                    "question": "What is the document name?",
+                    "answers": [{"text": "Contract A"}],
+                },
+            ],
         },
-        {
-            "id": "contract-1__Document Name_chunk_1",
+        "Contract A [p0-chunk1]": {
+            "contract_id": "contract-1__Document Name_chunk_1",
             "title": "Contract A [p0-chunk1]",
-            "context": "Contract A second chunk",
-            "answers": [],
+            "contract": "Contract A second chunk",
+            "dataset_mode": "cuad-chunk",
             "chunk_index": 1,
             "chunk_start": 16,
             "chunk_end": 38,
             "source_paragraph_index": 0,
+            "qas": [
+                {
+                    "id": "contract-1__Document Name_chunk_1",
+                    "question": "What is the document name?",
+                    "answers": [],
+                },
+            ],
         },
-    ]
+    }
 
     def fake_load(split, data_dir=None, dataset_mode="cuad-data"):
         assert dataset_mode == "cuad-chunk"
-        return rows
+        return records
 
-    monkeypatch.setattr(cuad_demo, "load_cuad_data", fake_load)
+    monkeypatch.setattr(cuad_demo, "load_cuad_records", fake_load)
 
     label_df = cuad_demo.get_label_df(
         num_contracts=2,
