@@ -34,7 +34,7 @@ dependencies = [
     "pyyaml>=6.0.1",
     "requests>=2.25",
     "ruff>=0.9.0",
-    "sentence-transformers==5.0.0",
+    "sentence-transformers==6.1.0",
     "setuptools>=70.1.1",
     "smolagents[toolkit]",
     "tabulate>=0.9.0",
@@ -53,27 +53,23 @@ classifiers=[
 
 [project.optional-dependencies]
 vllm = [
-    # Keep vLLM on the wheel-supported, Transformers 4-compatible stack used
-    # by sentence-transformers==5.0.0.  Newer releases require Transformers
-    # 5.x, while unconstrained resolution can fall back to a CUDA source
-    # build on the repository's glibc 2.28 hosts.
-    "vllm==0.23.0",
+    "vllm==0.30.0",
 ]
 sft = [
     "accelerate>=1.10.0",
     "bitsandbytes>=0.46.0",
     "peft>=0.17.0",
     "safetensors>=0.5.3",
-    "torch>=2.7.0",
-    "transformers>=4.57.0,<5.0.0",
+    "torch==2.13.0",
+    "transformers==5.17.0",
 ]
 sft-serving = [
-    "vllm==0.23.0",
+    "vllm==0.30.0",
 ]
 sft-kernels = [
-    "flash-attn>=2.8.3",
-    "flash-linear-attention>=0.5.2",
-    "causal-conv1d>=1.7.0",
+    "causal-conv1d==1.7.0",
+    "flash-linear-attention[cuda]==0.5.2",
+    "flash-attn-3",
 ]
 
 [tool.setuptools]
@@ -105,3 +101,21 @@ homepage = "https://palimpzest.org"
 repository = "https://github.com/mitdbg/palimpzest/"
 documentation = "https://palimpzest.org"
 # changelog = "https://github.com/me/spam/blob/master/CHANGELOG.md"
+
+[tool.uv]
+torch-backend = "cu130"
+no-build-isolation-package = ["causal-conv1d", "flash-attn-3"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+flash-attn-3 = { git = "https://github.com/Dao-AILab/flash-attention.git", subdirectory = "hopper" }
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.dependency-metadata]]
+name = "flash-attn-3"
+version = "3.0.0"
+requires-dist = ["torch", "einops", "packaging", "ninja"]

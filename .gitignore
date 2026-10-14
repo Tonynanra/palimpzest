@@ -36,7 +36,6 @@ scripts/litellm_stats/
 
 # virtual environment(s)
 venv/
-uv.lock
 
 # tmp
 testdata/maildir/
@@ -49,13 +48,20 @@ testdata/real-estate-eval-100.tar
 old-eval-results/
 eval-results/
 finetuning/artifacts/
+finetuning/h200-gpu-validation-*.out
+finetuning/h200-gpu-validation-*.err
 
 testdata/enron-eval/*.txt
 
 # your zed using open source contributor who only installs in a virtual environment
-.venv
+.venv/
 .zed
 pyrightconfig.json
+
+# local uv/Python state
+.uv/
+__pypackages__/
+.python-version
 
 myenv/
 pz-env/
