@@ -307,13 +307,16 @@ def test_serving_merged_checkpoint_uses_explicit_export_and_no_thinking(tmp_path
     assert list(config.output_dir.rglob("config_snapshot.yaml")) == [config.output_dir / "config_snapshot.yaml"]
 
 
-def test_evaluation_main_uses_snapshot_after_source_config_changes(monkeypatch, tmp_path):
+@pytest.mark.parametrize("save_raw_outputs", [False, True])
+def test_evaluation_main_uses_snapshot_after_source_config_changes(monkeypatch, tmp_path, save_raw_outputs):
     source = tmp_path / "sft.yaml"
     source.write_text(f"model: {MODEL_IDS[1]}\ntraining:\n  flash_attention: false\n", encoding="utf-8")
     config = replace(cuad_sft_config.load_training_config(source), output_dir=tmp_path / "run")
     cuad_sft_config.save_config_snapshot(config)
     source.write_text(f"model: {MODEL_IDS[0]}\n", encoding="utf-8")
     argv = ["--run-dir", str(config.output_dir), "--data-dir", "holdout"]
+    if save_raw_outputs:
+        argv.append("--save-raw-outputs")
     args = evaluate_cuad_sft.parse_args(argv)
     captured = {}
 
@@ -334,6 +337,7 @@ def test_evaluation_main_uses_snapshot_after_source_config_changes(monkeypatch, 
     assert captured["comparison_args"][0] == MODEL_IDS[1]
     assert captured["comparison_args"][1] == config.output_dir / "adapter"
     assert captured["comparison_args"][5] is False
+    assert captured["comparison_kwargs"]["raw_output_dir"] == (config.output_dir if save_raw_outputs else None)
     assert captured["report"]["model_id"] == MODEL_IDS[1]
     assert captured["output"] == config.output_dir / "comparison.json"
     assert captured["plot_dir"] == config.output_dir / "sft_plots"

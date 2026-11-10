@@ -9,11 +9,11 @@ import json
 import logging
 import time
 from collections import defaultdict
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 try:
     from .cuad_data import CuadJsonlDataset
@@ -38,6 +38,14 @@ LOGGER = logging.getLogger("cuad-sft-eval")
 class EvaluationResult:
     metrics: dict[str, Any]
     records: list[dict[str, Any]]
+
+
+@dataclass
+class RowCompletion:
+    completion: str
+    generation_kwargs: dict[str, Any]
+    raw_completion: str | None = None
+    prompt: str | None = None
 
 
 class InferenceWalltimeLogger:
@@ -146,7 +154,8 @@ def _completion_for_row(
     row: dict[str, Any],
     max_new_tokens: int,
     adapter_enabled: bool | None = None,
-) -> str:
+    save_raw_outputs: bool = False,
+) -> RowCompletion:
     import torch
 
     messages = _text_messages(row["messages"])
@@ -159,16 +168,30 @@ def _completion_for_row(
     ).to(model.device)
     input_ids = prompt_inputs["input_ids"]
     attention_mask = prompt_inputs.get("attention_mask")
+    generation_kwargs = {
+        "max_new_tokens": max_new_tokens,
+        "do_sample": False,
+        "pad_token_id": tokenizer.pad_token_id,
+    }
     with _adapter_context(model, adapter_enabled), torch.inference_mode():
         generated = model.generate(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            pad_token_id=tokenizer.pad_token_id,
+            **generation_kwargs,
         )
     completion_ids = generated[0, input_ids.shape[-1] :]
-    return tokenizer.decode(completion_ids, skip_special_tokens=True)
+    result = RowCompletion(
+        completion=tokenizer.decode(completion_ids, skip_special_tokens=True),
+        generation_kwargs=generation_kwargs,
+    )
+    if save_raw_outputs:
+        result.raw_completion = tokenizer.decode(
+            completion_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False,
+        )
+        result.prompt = tokenizer.decode(
+            input_ids[0], skip_special_tokens=False, clean_up_tokenization_spaces=False,
+        )
+    return result
 
 
 def _normalize_predictions(value: Any) -> list[str]:
@@ -236,7 +259,12 @@ def _evaluate_rows(
     adapter_enabled: bool | None = None,
     timing_logger: InferenceWalltimeLogger | None = None,
     timing_log_every: int = 10,
+    raw_output: TextIO | None = None,
+    checkpoint: Path | None = None,
+    completions: list[RowCompletion] | None = None,
 ) -> EvaluationResult:
+    if completions is not None and len(completions) != len(selected_rows):
+        raise ValueError("Expected exactly one completion per selected row")
     tp = fp = fn = 0
     parse_failures = missing_keys = extra_keys = 0
     expected_key_count = parsed_key_count = 0
@@ -255,7 +283,31 @@ def _evaluate_rows(
 
     for row_index, row in enumerate(selected_rows, start=1):
         row_started_perf = time.perf_counter()
-        completion = _completion_for_row(model, tokenizer, row, max_new_tokens, adapter_enabled)
+        if completions is None:
+            generated = _completion_for_row(
+                model, tokenizer, row, max_new_tokens, adapter_enabled,
+                save_raw_outputs=raw_output is not None,
+            )
+        else:
+            generated = completions[row_index - 1]
+        completion = generated.completion
+        if raw_output is not None:
+            raw_record = {
+                "row_index": row_index,
+                "model_role": model_role,
+                "model_id": model_id,
+                "checkpoint": str(checkpoint) if checkpoint is not None else None,
+                "tokenizer_source": tokenizer.name_or_path,
+                "mode": mode,
+                "generation_kwargs": generated.generation_kwargs,
+                "enable_thinking": False,
+                "row": row,
+                "prompt": generated.prompt,
+                "raw_completion": generated.raw_completion,
+                "completion": completion,
+            }
+            raw_output.write(json.dumps(raw_record, ensure_ascii=False) + "\n")
+            raw_output.flush()
         parse_failed = False
         try:
             parsed = get_json_from_answer(completion, _TextPromptModel(), Cardinality.ONE_TO_ONE)
@@ -494,19 +546,46 @@ def _run_comparison(
     use_flash_attention: bool,
     timing_logger: InferenceWalltimeLogger | None = None,
     timing_log_every: int = 10,
+    raw_output_dir: Path | None = None,
 ) -> dict[str, Any]:
-    if (checkpoint / "adapter_config.json").exists():
-        model, tokenizer = _load_adapter_model(model_id, checkpoint, use_flash_attention)
-        vanilla_result = _evaluate_rows(model, tokenizer, selected_rows, max_new_tokens, "vanilla", model_id, mode=mode, adapter_enabled=False, timing_logger=timing_logger, timing_log_every=timing_log_every)
-        sft_result = _evaluate_rows(model, tokenizer, selected_rows, max_new_tokens, "sft", model_id, mode=mode, adapter_enabled=True, timing_logger=timing_logger, timing_log_every=timing_log_every)
-        _release_model(model)
-    else:
-        vanilla_model = _load_base_model(model_id, use_flash_attention)
-        vanilla_result = _evaluate_rows(vanilla_model, _load_tokenizer(model_id), selected_rows, max_new_tokens, "vanilla", model_id, mode=mode, timing_logger=timing_logger, timing_log_every=timing_log_every)
-        _release_model(vanilla_model)
-        sft_model, sft_tokenizer = _load_merged_model(checkpoint, model_id, use_flash_attention)
-        sft_result = _evaluate_rows(sft_model, sft_tokenizer, selected_rows, max_new_tokens, "sft", model_id, mode=mode, timing_logger=timing_logger, timing_log_every=timing_log_every)
-        _release_model(sft_model)
+    with ExitStack() as stack:
+        raw_files: dict[str, TextIO] = {}
+        if raw_output_dir is not None:
+            raw_output_dir.mkdir(parents=True, exist_ok=True)
+            for role in ("vanilla", "sft"):
+                raw_files[role] = stack.enter_context(
+                    (raw_output_dir / f"{role}.raw.jsonl").open("w", encoding="utf-8")
+                )
+
+        if (checkpoint / "adapter_config.json").exists():
+            model, tokenizer = _load_adapter_model(model_id, checkpoint, use_flash_attention)
+            vanilla_result = _evaluate_rows(
+                model, tokenizer, selected_rows, max_new_tokens, "vanilla", model_id,
+                mode=mode, adapter_enabled=False, timing_logger=timing_logger,
+                timing_log_every=timing_log_every, raw_output=raw_files.get("vanilla"),
+            )
+            sft_result = _evaluate_rows(
+                model, tokenizer, selected_rows, max_new_tokens, "sft", model_id,
+                mode=mode, adapter_enabled=True, timing_logger=timing_logger,
+                timing_log_every=timing_log_every, raw_output=raw_files.get("sft"),
+                checkpoint=checkpoint,
+            )
+            _release_model(model)
+        else:
+            vanilla_model = _load_base_model(model_id, use_flash_attention)
+            vanilla_result = _evaluate_rows(
+                vanilla_model, _load_tokenizer(model_id), selected_rows, max_new_tokens, "vanilla", model_id,
+                mode=mode, timing_logger=timing_logger, timing_log_every=timing_log_every,
+                raw_output=raw_files.get("vanilla"),
+            )
+            _release_model(vanilla_model)
+            sft_model, sft_tokenizer = _load_merged_model(checkpoint, model_id, use_flash_attention)
+            sft_result = _evaluate_rows(
+                sft_model, sft_tokenizer, selected_rows, max_new_tokens, "sft", model_id,
+                mode=mode, timing_logger=timing_logger, timing_log_every=timing_log_every,
+                raw_output=raw_files.get("sft"), checkpoint=checkpoint,
+            )
+            _release_model(sft_model)
     return {"vanilla": vanilla_result.metrics, "sft": sft_result.metrics, "delta": _metric_delta(vanilla_result.metrics, sft_result.metrics)}
 
 
@@ -520,6 +599,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-new-tokens", type=_positive_int, default=8192)
     parser.add_argument("--limit", type=_positive_int, default=None)
     parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument(
+        "--save-raw-outputs", action="store_true",
+        help="Save self-contained vanilla.raw.jsonl and sft.raw.jsonl beside --output",
+    )
     parser.add_argument("--timing-log-every", type=_positive_int, default=10)
     parser.add_argument("--no-flash-attention", action="store_true")
     return parser
@@ -551,6 +634,7 @@ def main() -> None:
             args.flash_attention,
             timing_logger=timing_logger,
             timing_log_every=args.timing_log_every,
+            raw_output_dir=output_path.parent if args.save_raw_outputs else None,
         )
     finally:
         timing_logger.close()

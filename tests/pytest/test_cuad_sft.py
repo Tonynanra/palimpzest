@@ -1,5 +1,7 @@
 import json
 import sys
+from contextlib import contextmanager
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -316,7 +318,10 @@ def test_training_walltime_callback_logs_checkpoints(tmp_path):
 def test_inference_walltime_is_logged_periodically(monkeypatch, tmp_path):
     log_path = tmp_path / "inference_walltime.jsonl"
     logger = evaluate_cuad_sft.InferenceWalltimeLogger(log_path)
-    monkeypatch.setattr(evaluate_cuad_sft, "_completion_for_row", lambda *args, **kwargs: '{"Document Name":[]}')
+    monkeypatch.setattr(
+        evaluate_cuad_sft, "_completion_for_row",
+        lambda *args, **kwargs: evaluate_cuad_sft.RowCompletion('{"Document Name":[]}', {}),
+    )
     rows = [
         {
             "id": "row-1",
@@ -355,3 +360,300 @@ def test_inference_walltime_is_logged_periodically(monkeypatch, tmp_path):
     ]
     assert result.metrics["inference_walltime_seconds"] >= 0
     assert result.metrics["rows_per_second"] >= 0
+
+
+@pytest.fixture
+def raw_generation():
+    torch = pytest.importorskip("torch")
+    from transformers import BatchEncoding
+
+    class Tokenizer:
+        pad_token_id = 0
+        special_tokens = {1: "<|im_start|>", 2: "<|im_end|>"}
+
+        def __init__(self, source):
+            self.name_or_path = source
+            self.decode_calls = []
+
+        @staticmethod
+        def encode(text):
+            return [ord(char) + 10 for char in text]
+
+        def apply_chat_template(self, messages, **kwargs):
+            assert kwargs == {
+                "enable_thinking": False,
+                "tokenize": True,
+                "add_generation_prompt": True,
+                "return_tensors": "pt",
+            }
+            ids = []
+            for message in messages:
+                ids.extend([1, *self.encode(message["role"] + "\n" + message["content"]), 2])
+            ids.extend([1, *self.encode("assistant\n")])
+            input_ids = torch.tensor([ids])
+            return BatchEncoding({"input_ids": input_ids, "attention_mask": torch.ones_like(input_ids)})
+
+        def decode(self, ids, skip_special_tokens=False, clean_up_tokenization_spaces=None):
+            self.decode_calls.append((skip_special_tokens, clean_up_tokenization_spaces))
+            return "".join(
+                self.special_tokens[token] if token in self.special_tokens else chr(token - 10)
+                for token in ids.tolist()
+                if not (skip_special_tokens and token in self.special_tokens)
+            )
+
+    class Model:
+        device = "cpu"
+
+        def __init__(self, tokenizer, outputs):
+            self.tokenizer = tokenizer
+            self.outputs = iter(outputs)
+            self.generation_calls = []
+            self.adapter_enabled = True
+
+        @contextmanager
+        def disable_adapter(self):
+            previous = self.adapter_enabled
+            self.adapter_enabled = False
+            try:
+                yield
+            finally:
+                self.adapter_enabled = previous
+
+        def generate(self, **kwargs):
+            self.generation_calls.append({**kwargs, "adapter_enabled": self.adapter_enabled})
+            output = next(self.outputs)
+            if isinstance(output, Exception):
+                raise output
+            completion_ids = torch.tensor([self.tokenizer.encode(output) + [2]])
+            return torch.cat((kwargs["input_ids"], completion_ids), dim=-1)
+
+    def make(outputs, source="fake/tokenizer"):
+        tokenizer = Tokenizer(source)
+        return Model(tokenizer, outputs), tokenizer
+
+    return make
+
+
+@pytest.fixture
+def raw_file_handles(monkeypatch):
+    original_open = Path.open
+    handles = []
+
+    def tracking_open(path, mode="r", *args, **kwargs):
+        handle = original_open(path, mode, *args, **kwargs)
+        if path.name.endswith(".raw.jsonl") and mode == "w":
+            handles.append(handle)
+        return handle
+
+    monkeypatch.setattr(Path, "open", tracking_open)
+    return handles
+
+
+def _raw_evaluation_rows():
+    rows = []
+    for chunk_index, contract in enumerate(("Café contract", "Second contract")):
+        row = {
+            "id": "shared-id-6",
+            "split": "test",
+            "source_hash": "shared-source",
+            "source_title": "Sample contract",
+            "chunk_title": f"Sample contract [p0-chunk{chunk_index}]",
+            "contract_id": f"contract-chunk-{chunk_index}",
+            "contract": contract,
+            "chunk_index": chunk_index,
+            "chunk_start": chunk_index * 65536,
+            "chunk_end": chunk_index * 65536 + len(contract),
+            "view": "all",
+            "view_index": 6,
+            "categories": ["Document Name", "Agreement Date"],
+            "labels": {"Document Name": [contract.split()[0]], "Agreement Date": []},
+            "messages": [{"role": "user", "content": "Original unsorted prompt: " + contract}],
+        }
+        row["response"] = cuad_sft_data.build_json_target(row["categories"], row["labels"])
+        rows.append(row)
+    return rows
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_evaluator_cli_raw_output_capture_is_opt_in(enabled):
+    argv = ["--run-dir", "run", "--data-dir", "data"]
+    if enabled:
+        argv.append("--save-raw-outputs")
+    assert evaluate_cuad_sft.build_parser().parse_args(argv).save_raw_outputs is enabled
+
+
+@pytest.mark.parametrize("save_raw_outputs", [False, True])
+def test_raw_capture_decodes_one_generation_without_changing_parser_text(raw_generation, save_raw_outputs):
+    response = ' \nPreamble β\n{"Document Name":["Café"]}\n---  \n'
+    model, tokenizer = raw_generation([response])
+    result = evaluate_cuad_sft._completion_for_row(
+        model, tokenizer, _raw_evaluation_rows()[0], 128, save_raw_outputs=save_raw_outputs,
+    )
+
+    assert len(model.generation_calls) == 1
+    call = model.generation_calls[0]
+    assert result.generation_kwargs == {"max_new_tokens": 128, "do_sample": False, "pad_token_id": 0}
+    assert all(call[key] == value for key, value in result.generation_kwargs.items())
+    assert call["attention_mask"].shape == call["input_ids"].shape
+    assert result.completion == response
+    if save_raw_outputs:
+        assert result.raw_completion == response + "<|im_end|>"
+        assert result.prompt == "<|im_start|>user\nOriginal unsorted prompt: Café contract<|im_end|><|im_start|>assistant\n"
+        assert tokenizer.decode_calls == [(True, None), (False, False), (False, False)]
+    else:
+        assert result.raw_completion is None
+        assert result.prompt is None
+        assert tokenizer.decode_calls == [(True, None)]
+
+
+@pytest.mark.parametrize("checkpoint_kind", ["adapter", "merged"])
+def test_raw_comparison_records_preserve_rows_provenance_and_metrics(
+    monkeypatch, tmp_path, raw_generation, raw_file_handles, checkpoint_kind,
+):
+    checkpoint = tmp_path / checkpoint_kind
+    checkpoint.mkdir()
+    if checkpoint_kind == "adapter":
+        (checkpoint / "adapter_config.json").write_text("{}")
+    original_rows = _raw_evaluation_rows()
+    rows = evaluate_cuad_sft._prepare_rows(original_rows, "canonical", None)
+    outputs = [' \n{"Document Name":["Café"],"Agreement Date":[]}\n---  \n', "Malformed {\nβ"]
+    loaded = []
+
+    def load(outputs, source):
+        model, tokenizer = raw_generation(outputs, source)
+        loaded.append((model, tokenizer))
+        return model, tokenizer
+
+    monkeypatch.setattr(evaluate_cuad_sft, "_release_model", lambda model: None)
+    monkeypatch.setattr(
+        evaluate_cuad_sft, "_load_adapter_model",
+        lambda *args: load(outputs * 2, str(checkpoint)),
+    )
+    monkeypatch.setattr(evaluate_cuad_sft, "_load_base_model", lambda *args: load(outputs, "fake/base")[0])
+    monkeypatch.setattr(evaluate_cuad_sft, "_load_tokenizer", lambda *args: loaded[-1][1])
+    monkeypatch.setattr(evaluate_cuad_sft, "_load_merged_model", lambda *args: load(outputs, str(checkpoint)))
+
+    disabled = evaluate_cuad_sft._run_comparison("fake/base", checkpoint, rows, "canonical", 128, False)
+    assert not list(tmp_path.rglob("*.raw.jsonl"))
+    assert all(tokenizer.decode_calls == [(True, None)] * len(model.generation_calls) for model, tokenizer in loaded)
+    loaded.clear()
+    output_dir = tmp_path / "evaluation"
+    output_dir.mkdir()
+    for role in ("vanilla", "sft"):
+        (output_dir / f"{role}.raw.jsonl").write_text("stale record\n")
+    raw_file_handles.clear()
+    enabled = evaluate_cuad_sft._run_comparison(
+        "fake/base", checkpoint, rows, "canonical", 128, False, raw_output_dir=output_dir,
+    )
+
+    assert sum(len(model.generation_calls) for model, _ in loaded) == 2 * len(rows)
+    assert len(raw_file_handles) == 2
+    assert all(handle.closed for handle in raw_file_handles)
+    timing_keys = {"inference_walltime_seconds", "average_row_seconds", "rows_per_second"}
+    for role in ("vanilla", "sft"):
+        path = output_dir / f"{role}.raw.jsonl"
+        records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        assert [record["row_index"] for record in records] == [1, 2]
+        assert [record["row"] for record in records] == rows
+        assert rows[0]["id"] == rows[1]["id"]
+        assert original_rows[0]["categories"] == ["Document Name", "Agreement Date"]
+        for record, response in zip(records, outputs):
+            assert record["model_role"] == role
+            assert record["model_id"] == "fake/base"
+            assert record["checkpoint"] == (str(checkpoint) if role == "sft" else None)
+            expected_source = "fake/base" if checkpoint_kind == "merged" and role == "vanilla" else str(checkpoint)
+            assert record["tokenizer_source"] == expected_source
+            assert record["mode"] == "canonical"
+            assert record["generation_kwargs"] == {"max_new_tokens": 128, "do_sample": False, "pad_token_id": 0}
+            assert record["enable_thinking"] is False
+            assert record["row"]["categories"] == ["Agreement Date", "Document Name"]
+            assert "Original unsorted prompt" not in record["prompt"]
+            assert record["row"]["messages"][-1]["content"] in record["prompt"]
+            assert record["prompt"].endswith("<|im_start|>assistant\n")
+            assert record["raw_completion"] == response + "<|im_end|>"
+            assert record["completion"] == response
+        assert "Café" in path.read_text(encoding="utf-8")
+        assert enabled[role]["parse_failures"] == 1
+        assert enabled[role]["tp"] == 1
+        assert enabled[role]["fn"] == 1
+        assert {key: value for key, value in enabled[role].items() if key not in timing_keys} == {
+            key: value for key, value in disabled[role].items() if key not in timing_keys
+        }
+    assert enabled["delta"]["f1"] == disabled["delta"]["f1"]
+    if checkpoint_kind == "adapter":
+        assert [call["adapter_enabled"] for call in loaded[0][0].generation_calls] == [False, False, True, True]
+
+
+@pytest.mark.parametrize("failure", ["generation", "evaluation"])
+def test_raw_records_are_flushed_before_parsing_and_files_close_after_failure(
+    monkeypatch, tmp_path, raw_generation, raw_file_handles, failure,
+):
+    checkpoint = tmp_path / "adapter"
+    checkpoint.mkdir()
+    (checkpoint / "adapter_config.json").write_text("{}")
+    output_dir = tmp_path / "evaluation"
+    output_dir.mkdir()
+    (output_dir / "sft.raw.jsonl").write_text("stale SFT output\n")
+    raw_file_handles.clear()
+    model, tokenizer = raw_generation(["{}", RuntimeError("generation failed")])
+    monkeypatch.setattr(evaluate_cuad_sft, "_load_adapter_model", lambda *args: (model, tokenizer))
+    original_parser = evaluate_cuad_sft.get_json_from_answer
+    parser_calls = []
+
+    def parse_after_flush(*args):
+        lines = (output_dir / "vanilla.raw.jsonl").read_text().splitlines()
+        assert len(lines) == len(parser_calls) + 1
+        assert json.loads(lines[-1])["completion"] == args[0]
+        parser_calls.append(args[0])
+        return original_parser(*args)
+
+    monkeypatch.setattr(evaluate_cuad_sft, "get_json_from_answer", parse_after_flush)
+    if failure == "evaluation":
+        def fail_evaluation(*args):
+            raise RuntimeError("evaluation failed")
+
+        monkeypatch.setattr(evaluate_cuad_sft, "evaluate_entry", fail_evaluation)
+    with pytest.raises(RuntimeError, match=f"{failure} failed"):
+        evaluate_cuad_sft._run_comparison(
+            "fake/base", checkpoint, _raw_evaluation_rows(), "all", 128, False, raw_output_dir=output_dir,
+        )
+
+    assert parser_calls == ["{}"]
+    assert len((output_dir / "vanilla.raw.jsonl").read_text().splitlines()) == 1
+    assert (output_dir / "sft.raw.jsonl").read_text() == ""
+    assert len(raw_file_handles) == 2
+    assert all(handle.closed for handle in raw_file_handles)
+
+
+@pytest.mark.parametrize("operation", ["write", "flush"])
+def test_raw_output_io_errors_propagate_and_close_files(monkeypatch, tmp_path, raw_generation, operation):
+    class FailingOutput(StringIO):
+        def write(self, value):
+            if operation == "write":
+                raise OSError("raw write failed")
+            return super().write(value)
+
+        def flush(self):
+            if operation == "flush":
+                raise OSError("raw flush failed")
+            return super().flush()
+
+    writer = FailingOutput()
+    original_open = Path.open
+
+    def fail_raw_output(path, *args, **kwargs):
+        if path.name == "vanilla.raw.jsonl":
+            return writer
+        return original_open(path, *args, **kwargs)
+
+    checkpoint = tmp_path / "adapter"
+    checkpoint.mkdir()
+    (checkpoint / "adapter_config.json").write_text("{}")
+    model, tokenizer = raw_generation(["{}"])
+    monkeypatch.setattr(Path, "open", fail_raw_output)
+    monkeypatch.setattr(evaluate_cuad_sft, "_load_adapter_model", lambda *args: (model, tokenizer))
+    with pytest.raises(OSError, match=f"raw {operation} failed"):
+        evaluate_cuad_sft._run_comparison(
+            "fake/base", checkpoint, _raw_evaluation_rows(), "all", 128, False, raw_output_dir=tmp_path,
+        )
+    assert writer.closed

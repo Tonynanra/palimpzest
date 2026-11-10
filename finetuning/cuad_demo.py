@@ -25,7 +25,7 @@ except ImportError:
     from cuad_schema import validate_category_names as validate_category_names
 
 # 0.15 is used in the Doc-ETL paper. It should be 0.5 for the actual benchmark.
-IOU_THRESH = 0.15
+IOU_THRESH = 0.5
 
 
 def get_label_df(
