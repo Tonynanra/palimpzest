@@ -46,6 +46,8 @@ The assistant completion ends with `---`, matching the existing Palimpzest conve
 | [cuad_sft_config.py](cuad_sft_config.py) | Shared model selection, configuration parsing, and run-root snapshots. |
 | [train_cuad_sft.py](train_cuad_sft.py) | Loads the selected model, attaches LoRA/QLoRA, masks prompt tokens, and trains. |
 | [evaluate_cuad_sft.py](evaluate_cuad_sft.py) | Generates predictions and reports CUAD extraction metrics. |
+| [evaluate_cuad_openrouter.py](evaluate_cuad_openrouter.py) | Runs standalone GPT-6 Luna inference through OpenRouter and records raw responses, usage, costs, and latency. |
+| [evaluate_cuad_span_transitions.py](evaluate_cuad_span_transitions.py) | Scores paired span transitions from saved outputs and plots the four transition rates. |
 | [merge_cuad_sft_adapter.py](merge_cuad_sft_adapter.py) | Merges a PEFT adapter into a standalone checkpoint. |
 | [serve_cuad_sft.py](serve_cuad_sft.py) | Launches adapter or merged-model vLLM serving. |
 | [cuad_qwen_benchmark.py](cuad_qwen_benchmark.py) | Existing Palimpzest benchmark, extended with local endpoint and `convert_mode` support. |
@@ -216,6 +218,7 @@ The output directory contains `vanilla.json`, `sft.json`, `comparison.json`, and
 | `--max-new-tokens` | `8192` | Generation limit. |
 | `--limit` | unset | Optional row limit for a smoke evaluation. |
 | `--output` | run root/`comparison.json` | Comparison JSON output path. The vanilla and SFT reports are written beside it. |
+| `--save-raw-outputs` | false | Save self-contained `vanilla.raw.jsonl` and `sft.raw.jsonl` beside the comparison report. |
 | `--timing-log-every` | `10` | Log inference progress after every N rows for each model. |
 | `--no-flash-attention` | false | Force the non-FlashAttention path. |
 
@@ -233,6 +236,40 @@ Reported metrics include:
 Inference walltime is written to `inference_walltime.jsonl` beside the comparison report.
 It contains start and periodic progress events for both vanilla and SFT, including completed rows, elapsed seconds, last-row seconds, and rows per second.
 
+To retain model outputs for downstream evaluation, add `--save-raw-outputs`:
+
+```bash
+./.venv/bin/python finetuning/evaluate_cuad_sft.py \
+  --run-dir finetuning/artifacts/cuad-sft-runs/demo \
+  --data-dir testdata/cuad/sft/test \
+  --split test \
+  --mode all \
+  --save-raw-outputs \
+  --output finetuning/artifacts/cuad-sft-runs/demo/evaluation-test/comparison.json
+```
+
+Each raw JSONL file contains one record per selected row, in evaluation order. The records include:
+
+| Field | Meaning |
+|---|---|
+| `row_index` | 1-based position in the selected rows, shared between vanilla and SFT. IDs can repeat across chunks; retain this index and the chunk/view metadata when comparing outputs. |
+| `model_role`, `model_id` | `vanilla` or `sft`, and the base model identity from the run snapshot. |
+| `checkpoint` | SFT adapter or merged checkpoint path; null for vanilla. |
+| `tokenizer_source` | The loaded tokenizer's source. Adapter comparisons share the checkpoint tokenizer when present, including for vanilla generation. |
+| `mode` | Evaluation mode. |
+| `generation_kwargs` | The `max_new_tokens`, `do_sample`, and `pad_token_id` controls passed to generation. |
+| `enable_thinking` | The no-thinking chat-template setting (`false`). |
+| `row` | The complete evaluated input, including contract text, categories, reference labels, messages, and source/chunk/view metadata. Canonical mode saves the updated categories and messages. |
+| `prompt` | The decoded actual input tokens, including special-token markers, with tokenizer whitespace cleanup disabled. |
+| `raw_completion` | Generated text excluding the prompt, including special-token markers and surrounding prose, with tokenizer whitespace cleanup disabled. |
+| `completion` | The exact decoded text passed to the existing evaluator, which removes special tokens before parsing. |
+
+JSON encoding escapes embedded newlines so each record occupies one physical line; `json.loads(line)` restores the saved text. Reference labels and contract text are included, so alternate parsers, matching rules, and grounding checks can operate without the original dataset files.
+
+Records are written and flushed before parsing, including malformed responses. Both raw files are overwritten at the start of a capture-enabled invocation. Completed records remain available if a later generation or evaluation fails; file errors stop evaluation. Capture uses the same generation call as normal evaluation, and its additional decoding and writes are included in inference walltime. Existing metrics, report schemas, and plots retain their current behavior.
+
+This option saves decoded text for new inference invocations. Existing aggregate reports cannot supply historical raw completions.
+
 Plots are always written under `sft_plots/` beside the comparison report:
 
 - `aggregate_metrics.png`
@@ -241,6 +278,113 @@ Plots are always written under `sft_plots/` beside the comparison report:
 - `per_category_f1.png`
 - `per_category_f1_delta.png`
 - `format_metrics.png`
+
+### Standalone GPT-6 Luna inference
+
+Run one model against the selected CUAD rows without loading a local checkpoint or producing a comparison:
+
+```bash
+./.venv/bin/python finetuning/evaluate_cuad_openrouter.py \
+  --data-dir testdata/cuad/sft/test \
+  --split test \
+  --mode all \
+  --output finetuning/artifacts/cuad-openrouter-runs/luna
+```
+
+The script reads `OPENROUTER_API_KEY` directly from the repository-root `.env` file; a missing or empty key stops the run. It targets `openai/gpt-6-luna`, sends the saved CUAD messages as Chat Completions, and uses the configured reasoning effort (`medium`). OpenRouter uses its default routing and provider failover within the standard OpenAI/Azure allowlist; regional Azure variants are excluded. The Python SDK also uses its default HTTP retry policy, currently two retries, for both pricing lookup and inference. A terminal error after SDK retries are exhausted is recorded and stops the run; malformed completion JSON is retained and counted by the existing evaluator.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--data-dir` | required | Directory containing the CUAD SFT JSONL rows. |
+| `--split` | `test` | Read `train`, `dev`, `test`, or all three splits. |
+| `--mode` | `all` | `all`, `singleton`, `grouped`, `randomized`, or `canonical`, using the same row selection as local inference. |
+| `--max-new-tokens` | `8192` | Maximum completion tokens requested. |
+| `--limit` | unset | Optional row limit for a small inference run. |
+| `--output` | required | Run output directory. The runner creates `openrouter.json` and its raw, error, and walltime files inside it. Existing output files are not overwritten. |
+| `--timing-log-every` | `10` | Write inference progress after every N rows. |
+
+For a run directory such as `luna/`, the script writes `openrouter.json`, `openrouter.raw.jsonl`, `openrouter.errors.jsonl`, and `openrouter.inference_walltime.jsonl` inside it. Each raw record embeds the selected input row, exact request messages and settings, raw completion, full API response and usage, returned model/provider metadata, finish reason, request latency, observed SDK retries, and HTTP attempts. Completed raw records are flushed immediately. The summary is written initially and on completion/failure; the periodic walltime log supplies live progress.
+
+Token usage is retained per response and aggregated in the summary: input, cached input, cache writes, and output tokens. The script snapshots standard OpenAI and Azure pricing before inference and records the retrieval time and source. Providers need not have matching prices or both be healthy during lookup. It calculates ordinary input, cache-read, cache-write, and output costs from the serving endpoint's rates, applying any prompt-length pricing override. OpenRouter's reported billed cost is retained separately in credits. Missing usage or pricing fields produce null costs with reasons and incomplete totals with missing-row counts. Usage and billing describe returned responses; charges for failed internal attempts are unavailable. The summary also contains the evaluator's precision, recall, F1, TP/FP/FN, parse, key, grounding, and per-category metrics.
+
+The runner sends up to 64 row requests concurrently. Raw records are flushed as responses complete, so JSONL order can differ from evaluation order; use `row_index` when pairing records. A terminal request error stops submission of later batches, cancels work that has not started, and waits for already-running calls in the current batch so their responses and errors can be recorded.
+
+The reported `end_to_end_seconds` covers dataset loading, pricing lookup, inference, and scoring. Request latency includes SDK retries and backoff. `requests_attempted` counts logical row requests started, while `inference_http_attempts` counts observed SDK HTTP attempts; neither measures OpenRouter's internal provider attempts. Unknown retry counts remain null. A failure summary preserves completed raw rows and their known usage and cost totals.
+
+### Replay saved generation
+
+Recreate the evaluator's reports and plots from a completed raw capture, without loading a model, tokenizer, or dataset:
+
+```bash
+./.venv/bin/python finetuning/evaluate_cuad_sft_from_raw.py \
+  --evaluation-dir finetuning/artifacts/cuad-sft-runs/2376707 \
+  --output-dir /tmp/cuad-sft-replay
+```
+
+The source directory must contain `comparison.json`, `inference_walltime.jsonl`, `vanilla.raw.jsonl`, and `sft.raw.jsonl`. For differently named captures such as `vanilla_raw.jsonl` and `sft_raw.jsonl`, supply their paths with `--vanilla-raw` and `--sft-raw`.
+
+Replay uses the embedded input rows and the saved `completion` text through the original scoring and plotting code. It pairs records by `row_index` and rejects missing, duplicate, or mismatched rows and model/mode metadata. It writes the same three JSON reports, six plots, two raw captures, and timing log into the separate output directory.
+
+All extraction, formatting, grounding, and delta metrics are recomputed. The three inference timing metrics and original timing log are preserved from the source evaluation because raw captures do not contain elapsed times. Those values describe the original generation, not replay performance. Only `inference_walltime_log` changes to point to the copied log in the output directory.
+
+### Three-way saved inference comparison
+
+Compare saved Vanilla, SFT, and OpenRouter API results without running inference:
+
+```bash
+./.venv/bin/python finetuning/compare_cuad_inference.py \
+  finetuning/artifacts/cuad-sft-runs/2376707 \
+  finetuning/artifacts/cuad-openrouter-runs/luna
+```
+
+Pass the Vanilla/SFT evaluation directory first and the API result directory second. The first directory must contain `comparison.json`, `vanilla.raw.jsonl`, and `sft.raw.jsonl`; the second must contain a complete `openrouter.json` run and `openrouter.raw.jsonl`. The script checks row counts, mode, split, complete row coverage, and identical embedded input rows, pairing by `row_index`.
+
+All three saved completions are rescored with the shared evaluator. Source inference timings are retained. Reports and plots go to `finetuning/artifacts/cuad-three-way-comparison/`, leaving the input artifacts unchanged. The report includes only the API-minus-SFT delta. Its `sft_plots/` contains the aggregate, per-category precision/recall/F1, API-minus-SFT per-category F1, and formatting/grounding plots.
+
+### Jaccard distribution from saved generation
+
+Plot Vanilla and SFT Jaccard histograms with vertical threshold markers and x-axis ticks at `0.15` and `0.5`:
+
+```bash
+./.venv/bin/python finetuning/plot_cuad_jaccard_distribution.py \
+  --evaluation-dir finetuning/artifacts/cuad-sft-runs/2376707
+```
+
+The script requires `comparison.json`, `vanilla.raw.jsonl`, and `sft.raw.jsonl`, with complete, matching captures. It reuses the evaluator's completion parsing, prediction normalization, and word-set Jaccard function without loading a model, tokenizer, or dataset. Output defaults to `sft_plots/jaccard_distribution.png` within the evaluation directory; use `--output` to choose another path.
+
+Each sample is one gold annotation's highest Jaccard score against predictions for the same category and chunk. Both models use the same gold-span population, retaining repeated annotations. Missing predictions, missing keys, and malformed/non-object completions contribute zero scores; categories with no gold spans contribute no samples. The plot uses 20 shared bins over `[0, 1]`, shows counts, and measures pure Jaccard without the `Parties` substring exception. It describes gold-span coverage and match quality; false-positive predictions are not separate samples. The score distribution and both threshold markers are independent of the configured `IOU_THRESH`.
+
+## Span transition evaluation
+
+Score a completed `--mode all --save-raw-outputs` evaluation without loading model weights or generating new outputs:
+
+```bash
+./.venv/bin/python finetuning/evaluate_cuad_span_transitions.py \
+  --evaluation-dir finetuning/artifacts/cuad-sft-runs/2607445/evaluation-test
+```
+
+The scorer requires `comparison.json`, `vanilla.raw.jsonl`, and `sft.raw.jsonl`, with all expected rows captured for both models. It pairs by `row_index`, verifies identical embedded inputs and matching model identity/mode, and rejects duplicate indices, incomplete captures, or malformed JSONL. Stored SFT IDs can repeat across chunks.
+
+For each evaluated chunk, the candidate set is the union of distinct, original answer strings annotated under all 41 categories. Each candidate is positive for a category exactly when its string appears in that category's labels; otherwise it is negative. Identical strings are counted once per chunk/category, and a string annotated under multiple categories is positive for each. Unannotated text and hallucinated spans outside this candidate set do not add cases. Existing chunk boundaries are retained.
+
+A model predicts positive when any of its extracted answers for the target category matches the candidate using the existing Jaccard threshold (`0.15`) or the `Parties` substring exception. Malformed/non-object completions and missing category values yield empty predictions, consistent with the existing evaluator. Parse failures are recorded in the report.
+
+The paired cells use Vanilla as rows and SFT as columns:
+
+| Gold label | Vanilla | SFT Predict 1 | SFT Predict 0 |
+|---|---|---:|---:|
+| Y = 1 | Predict 1 | a | b |
+| Y = 1 | Predict 0 | c | d |
+| Y = 0 | Predict 1 | h | g |
+| Y = 0 | Predict 0 | f | e |
+
+The command writes three additional artifacts beside the original reports:
+
+- `span_transitions.json`: aggregate and per-category cells, supports, rates, numerators/denominators, and source/matching metadata. Overall rates use pooled counts.
+- `span_transitions.md`: the two overall tables, four rates, and embedded plot.
+- `span_transitions.png`: four bars, ordered FN recovery `c/(c+d)`, FP correction `g/(g+h)`, TP loss `b/(a+b)`, and New FP introduction `f/(e+f)`. The first two share blue (`#0072B2`, Improvements); the last two share orange (`#D55E00`, Regressions). The y-axis spans 0–100%, and each bar includes its percentage and numerator/denominator. The PNG is 10 × 5 inches at 180 DPI.
+
+Zero-denominator rates are `null` in JSON and `N/A` in the Markdown and plot, without a numeric bar height. The existing evaluation reports and plots are unchanged.
 
 ## Merge and serving
 
@@ -351,3 +495,15 @@ From the repository root on any Slurm node:
 ```bash
 sbatch finetuning/run_h200_cuad_sft.slurm
 ```
+
+For an inference-only job, submit [run_h200_cuad_inference.slurm](run_h200_cuad_inference.slurm) without script arguments:
+
+```bash
+sbatch finetuning/run_h200_cuad_inference.slurm
+```
+
+The script contains all inference arguments. It is configured for training run `2376707`, its `adapter/` checkpoint, the existing `testdata/cuad/sft/test/test.jsonl` holdout, `--mode all`, an 8,192-token generation limit, progress logging every 10 rows, and raw capture. The source run must contain `config_snapshot.yaml`. It performs standalone vanilla-vs-SFT evaluation without training or dataset generation.
+
+Results go under the configured `INFERENCE_DIR`, currently `finetuning/artifacts/cuad-sft-runs/2376707/`. That directory contains `comparison.json`, `vanilla.json`, `sft.json`, both raw JSONL files, `inference_walltime.jsonl`, and `sft_plots/`. Repeated invocations overwrite those evaluation outputs. Scheduler stdout/stderr are written to `finetuning/cuad-inference-{SLURM_JOB_ID}.{out,err}`.
+
+This job uses one H200 with the same Quanta account, partition, QoS, CPU count, and RAM as the training script, with a 12-hour limit and scheduler-selected node. Change resources in its `#SBATCH` directives, paths in its `readonly` assignments, and evaluator controls in the Python command inside the script. For a smoke run, add `--limit 8` and change `--max-new-tokens` to `128` there. A 128-token smoke run validates execution and may truncate responses; use the normal generation budget for accuracy evaluation.
